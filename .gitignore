@@ -1,0 +1,14 @@
+# 运行时数据：直播间、收藏夹、说书文字和进度、日志（每个人自己的，不上传）
+data/
+启动错误.txt
+
+# 打包环境和打包结果（exe 发布在 GitHub 的 Releases 页面）
+.build/
+dist/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 测试临时文件
+.test/
