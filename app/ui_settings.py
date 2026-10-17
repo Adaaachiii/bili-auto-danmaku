@@ -51,6 +51,7 @@ class SettingsPage(QWidget):
         self.poll_spin = QSpinBox()
         self.poll_spin.setRange(MIN_POLL_INTERVAL, MAX_POLL_INTERVAL)
         self.poll_spin.setFixedWidth(100)
+        self.auto_monitor_check = QCheckBox("程序启动后自动检测直播间状态")
         self.on_start_combo = _combo(ON_START_CHOICES)
         self.browser_combo = _combo(BROWSER_CHOICES)
         self.close_combo = _combo(CLOSE_CHOICES)
@@ -62,6 +63,10 @@ class SettingsPage(QWidget):
         form.setVerticalSpacing(10)
         form.addRow("检测间隔：", unit_row(self.poll_spin))
         form.addRow("", hint_label("检测间隔建议大于30秒"))
+        form.addRow("", self.auto_monitor_check)
+        auto_hint = hint_label("关闭后，程序启动时先暂停监控，点“继续监控”才开始检测和发送")
+        auto_hint.setWordWrap(False)
+        form.addRow("", auto_hint)
         form.addRow("若启动时监控直播间已开播：", self.on_start_combo)
         form.addRow("打开直播页用：", self.browser_combo)
         form.addRow("关闭窗口时：", self.close_combo)
@@ -111,6 +116,7 @@ class SettingsPage(QWidget):
 
     def load(self, cfg: AppConfig, autostart: bool) -> None:
         self.poll_spin.setValue(cfg.poll_interval_sec)
+        self.auto_monitor_check.setChecked(cfg.auto_monitor)
         self.on_start_combo.setCurrentIndex(self.on_start_combo.findData(cfg.on_start_live))
         self.browser_combo.setCurrentIndex(self.browser_combo.findData(cfg.browser))
         self.close_combo.setCurrentIndex(self.close_combo.findData(cfg.close_action))
@@ -120,6 +126,7 @@ class SettingsPage(QWidget):
 
     def apply_to(self, cfg: AppConfig) -> None:
         cfg.poll_interval_sec = self.poll_spin.value()
+        cfg.auto_monitor = self.auto_monitor_check.isChecked()
         cfg.on_start_live = self.on_start_combo.currentData()
         cfg.browser = self.browser_combo.currentData()
         cfg.close_action = self.close_combo.currentData()

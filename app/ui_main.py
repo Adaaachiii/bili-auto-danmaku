@@ -115,6 +115,8 @@ class MainWindow(QMainWindow):
         self.engine.set_rooms(self.cfg.rooms)
         self._rebuild_table()
         self._load_saved_login()
+        if not self.cfg.auto_monitor:
+            self.engine.set_paused(True)  # 在后台线程开始之前就暂停，一次都不检测
         self.engine.start()
 
         self._clock = QTimer(self)
@@ -122,6 +124,9 @@ class MainWindow(QMainWindow):
         self._clock.start(1000)
         self._update_monitor_label()
         self._log("info", "程序已启动")
+        if not self.cfg.auto_monitor:
+            self._show_paused(True)
+            self._log("info", "按设置，启动后先不检测直播间，点“继续监控”开始")
 
     # ================================================================ 界面搭建
 
@@ -909,13 +914,17 @@ class MainWindow(QMainWindow):
     def _toggle_pause(self) -> None:
         paused = not self.engine.is_paused()
         self.engine.set_paused(paused)
+        self._show_paused(paused)
+        self._log("info", "已暂停监控" if paused else "已继续监控")
+
+    def _show_paused(self, paused: bool) -> None:
+        """按钮文字、托盘图标、表格和监控状态跟着暂停 / 继续一起变。"""
         label = "继续监控" if paused else "暂停监控"
         self.pause_btn.setText(label)
         self.poll_btn.setEnabled(not paused)  # 暂停时不检测，“立即检测”没有意义
         if self.tray:
             self.tray_pause_action.setText(label)
             self.tray.setIcon(make_app_icon(paused))
-        self._log("info", "已暂停监控" if paused else "已继续监控")
         self._rebuild_table()
         self._update_monitor_label()
 

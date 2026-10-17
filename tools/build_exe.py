@@ -7,7 +7,8 @@
 
 from __future__ import annotations
 
-import os
+import platform
+import shutil
 import struct
 import sys
 import zipfile
@@ -24,11 +25,16 @@ from app.config import APP_TITLE, APP_VERSION  # noqa: E402
 KEEP_TRANSLATIONS = {"qtbase_zh_CN.qm"}
 # 软件模拟的 OpenGL，只有用到 OpenGL 的程序才需要，这个程序全是普通窗口控件
 DROP_FILES = {"opengl32sw.dll"}
+# Qt 的 Python 包里没带 LGPL 原文，用仓库 licenses 文件夹里的
+QT_PACKAGES = {"pyside6-essentials", "shiboken6"}
+QT_LICENSE_FILES = ("LGPL-3.0.txt", "GPL-3.0.txt")
 
 
 def make_icon(path: Path) -> None:
-    """用程序里画图标的代码生成 exe 的图标（.ico 里放多种尺寸的 PNG）。"""
-    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    """用程序里画图标的代码生成 exe 的图标（.ico 里放多种尺寸的 PNG）。
+
+    不能用 offscreen 模式：那种模式下 Qt 找不到系统字体，“弹”字会画成方框。
+    """
     from PySide6.QtCore import QBuffer, QByteArray, QIODevice
     from PySide6.QtWidgets import QApplication
 
@@ -91,6 +97,96 @@ def slim(app_dir: Path) -> int:
     return saved
 
 
+def _canonical(name: str) -> str:
+    return name.lower().replace("_", "-").replace(".", "-")
+
+
+def runtime_distributions() -> list:
+    """requirements.txt 里的包，加上它们在 Windows 上要用到的依赖包（也就是会被打包进 exe 的那些）。"""
+    from importlib.metadata import PackageNotFoundError, distribution
+
+    from packaging.requirements import Requirement
+
+    lines = (ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines()
+    todo = [Requirement(line).name for line in lines if line.strip() and not line.startswith("#")]
+    found = {}
+    while todo:
+        name = _canonical(todo.pop())
+        if name in found:
+            continue
+        try:
+            dist = distribution(name)
+        except PackageNotFoundError:
+            continue
+        found[name] = dist
+        for spec in dist.requires or []:
+            req = Requirement(spec)
+            if req.marker is None or req.marker.evaluate({"extra": ""}):
+                todo.append(req.name)
+    return sorted(found.values(), key=lambda d: d.metadata["Name"].lower())
+
+
+def _license_name(dist) -> str:
+    meta = dist.metadata
+    name = meta.get("License-Expression") or ""
+    if not name and len(meta.get("License") or "") <= 40:  # 有的包把整篇许可证塞在这一栏里
+        name = meta.get("License") or ""
+    if not name:
+        classifiers = [c for c in meta.get_all("Classifier") or [] if c.startswith("License :: ")]
+        name = classifiers[0].split(" :: ")[-1] if classifiers else ""
+    return name or "见许可文件"
+
+
+def collect_licenses(app_dir: Path) -> None:
+    """把本程序和 exe 里随附的第三方组件的许可证放进 licenses 文件夹，再写一份清单。"""
+    import PyInstaller
+
+    target = app_dir / "licenses"
+    target.mkdir(exist_ok=True)
+    shutil.copyfile(ROOT / "LICENSE", target / f"{APP_TITLE}-LICENSE.txt")
+    for name in QT_LICENSE_FILES:
+        shutil.copyfile(ROOT / "licenses" / name, target / name)
+    shutil.copyfile(Path(sys.base_prefix) / "LICENSE.txt", target / "Python-LICENSE.txt")
+    rows = [("Python（含 OpenSSL、SQLite 等）", platform.python_version(), "PSF-2.0 等", "Python-LICENSE.txt")]
+
+    for dist in runtime_distributions():
+        name = dist.metadata["Name"]
+        if _canonical(name) in QT_PACKAGES:
+            rows.append((name, dist.version, "LGPL-3.0-only", "、".join(QT_LICENSE_FILES)))
+            continue
+        copied = []
+        for file in dist.files or []:
+            if any(key in file.name.upper() for key in ("LICENSE", "COPYING", "NOTICE")):
+                dest = f"{name}-{file.name}"
+                shutil.copyfile(file.locate(), target / dest)
+                copied.append(dest)
+        rows.append((name, dist.version, _license_name(dist), "、".join(copied)))
+
+    pyinstaller_dir = Path(PyInstaller.__file__).parent
+    copying = next(pyinstaller_dir.parent.glob("pyinstaller-*.dist-info/licenses/COPYING.txt"), None)
+    if copying:
+        shutil.copyfile(copying, target / "PyInstaller-COPYING.txt")
+    rows.append(("PyInstaller（exe 的启动部分）", PyInstaller.__version__, "GPL-2.0-or-later，附带允许用于任何程序的例外条款", "PyInstaller-COPYING.txt"))
+
+    table = "\n".join(f"- {name} {version}：{license_name}（{files}）" for name, version, license_name, files in rows)
+    (target / "许可说明.txt").write_text(
+        f"""{APP_TITLE} {APP_VERSION}
+
+本程序以 MIT 许可证发布，见 {APP_TITLE}-LICENSE.txt。
+
+程序里随附了下面这些第三方组件，各自按自己的许可证授权，括号里是许可文件：
+
+{table}
+
+关于 Qt（PySide6、shiboken6）：
+按 LGPL-3.0 授权使用，没有做任何修改，许可原文见 LGPL-3.0.txt 和 GPL-3.0.txt。
+它们是独立的 DLL / .pyd 文件，放在 _internal\\PySide6 和 _internal\\shiboken6 文件夹里，可以替换成其他兼容版本。
+源代码可以从 Qt 官方获取：https://code.qt.io（Qt 和 PySide6）、https://download.qt.io/official_releases/QtForPython/
+""",
+        encoding="utf-8",
+    )
+
+
 def make_zip(app_dir: Path) -> Path:
     archive = DIST / f"BiliAutoDanmaku-v{APP_VERSION}-win-x64.zip"
     archive.unlink(missing_ok=True)
@@ -135,6 +231,7 @@ def main() -> None:
     )
 
     saved = slim(app_dir)
+    collect_licenses(app_dir)
     archive = make_zip(app_dir)
     print()
     print(f"打包完成：{app_dir / (APP_TITLE + '.exe')}")
