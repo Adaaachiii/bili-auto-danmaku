@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
@@ -42,6 +43,7 @@ class SettingsPage(QWidget):
     """点“保存设置”时发出 saved 信号，主窗口负责把设置应用到程序。"""
 
     saved = Signal()
+    update_requested = Signal()  # 点了“从压缩包更新”
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -105,7 +107,17 @@ class SettingsPage(QWidget):
         box.addLayout(save_row)
         box.addSpacing(12)
         box.addLayout(folder_row)
-        box.addWidget(hint_label(f"{APP_TITLE} {APP_VERSION}"))
+        version_row = QHBoxLayout()
+        version_row.addWidget(hint_label(f"{APP_TITLE} {APP_VERSION}"))
+        if getattr(sys, "frozen", False):
+            update_btn = QPushButton("从压缩包更新…")
+            update_btn.setToolTip("选择从 GitHub Releases 下载的新版本压缩包，程序会自动替换并重新打开，数据不受影响")
+            update_btn.clicked.connect(self.update_requested.emit)
+            version_row.addWidget(update_btn)
+        else:
+            version_row.addWidget(hint_label("（源码版，用 git pull 更新）"))
+        version_row.addStretch(1)
+        box.addLayout(version_row)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 14, 16, 14)

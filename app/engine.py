@@ -6,6 +6,7 @@
 
 界面调用 set_xxx / start_session 等方法改设置（线程安全），
 引擎通过 Qt 信号把状态变化、日志和通知告诉界面。
+每次“开始发弹幕 → 停止发弹幕”的统计写进历史记录（history.py）。
 """
 
 from __future__ import annotations
@@ -22,6 +23,7 @@ from PySide6.QtCore import QObject, Signal
 from . import bili_api, story
 from .bili_api import BiliApiError, Credentials, SendOutcome, SendResult
 from .config import MODE_REPEAT, MODE_STORY, ON_START_SEND_AND_OPEN, ON_START_WAIT, RoomConfig
+from .history import HistoryStore
 from .story import StoryText
 
 log = logging.getLogger(__name__)
@@ -91,6 +93,10 @@ class _RoomState:
     error: str = ""
     story: StoryText | None = None
     story_pos: int = 0
+    generation: int = 0  # 每开始一轮发送加 1，用来判断历史记录是不是该另起一条
+    end_reason: str = ""  # 这一轮为什么停下，写进历史记录
+    record_id: int | None = None  # 正在记的那条历史记录
+    record_gen: int = 0  # 那条记录属于第几轮
 
     @property
     def name(self) -> str:
@@ -110,6 +116,7 @@ class _RoomState:
     def begin_session(self, new_live: bool = False) -> None:
         """开始发送。new_live 表示这是新的一场直播：没开“说书状态继承”时，说书从头开始。"""
         self.session = Session.SENDING
+        self.generation += 1
         self.sent_count = 0
         self.failures = 0
         self.next_send_at = time.monotonic()
@@ -145,9 +152,11 @@ class Engine(QObject):
     notify = Signal(str, str)  # (标题, 内容)
     open_page = Signal(int)  # 房间号
     auth_invalid = Signal(str)  # B 站返回的原因
+    history_changed = Signal()  # 有历史记录开始或结束
 
-    def __init__(self, poll_interval: int, on_start_live: str):
+    def __init__(self, poll_interval: int, on_start_live: str, history: HistoryStore | None = None):
         super().__init__()
+        self._history = history
         self._lock = threading.RLock()
         self._rooms: dict[int, _RoomState] = {}
         self._poll_interval = poll_interval
@@ -203,8 +212,12 @@ class Engine(QObject):
                                 state.begin_session()
                             else:
                                 state.session = Session.IDLE
+                                state.end_reason = "关闭了“未开播时也发送”"
                 self._sync_story(state, events)
                 updated[cfg.room_id] = state
+            for room_id, state in self._rooms.items():
+                if room_id not in updated and state.record_id is not None:
+                    self._close_record(state, time.time(), events, "删除了直播间")
             self._rooms = updated
         self._dispatch(events)
         self._wake.set()
@@ -251,6 +264,8 @@ class Engine(QObject):
             state = self._rooms.get(room_id)
             if state is None or not state.cfg.enabled or not state.can_send_now():
                 return False
+            if state.session is Session.SENDING:
+                state.end_reason = "手动重新开始本场发送"
             state.begin_session()
             name = state.name
         self._emit_log("info", f"[{name}] 手动开始本场发送")
@@ -265,6 +280,7 @@ class Engine(QObject):
             if state is None or state.session is not Session.SENDING:
                 return False
             state.session = Session.STOPPED
+            state.end_reason = "手动停止"
             name, count = state.name, state.sent_count
         self._emit_log("info", f"[{name}] 手动停止本场发送（本场已发 {count} 条）")
         self.room_changed.emit(room_id)
@@ -340,6 +356,7 @@ class Engine(QObject):
                         self._poll(session)
                         self._next_poll_at = time.monotonic() + self._poll_interval
                     self._send_due(session)
+                self._check_records()
             except Exception:  # 后台线程不能因为一个意外错误就整个停掉
                 log.exception("监控线程出错")
                 self._emit_log("error", "监控出现意外错误，详情见日志文件；程序会继续运行")
@@ -414,6 +431,8 @@ class Engine(QObject):
                         if self._on_start_live == ON_START_SEND_AND_OPEN and state.cfg.open_browser:
                             events.append(("open", room_id))
                 elif previous is False:  # 开播
+                    if state.session is Session.SENDING:
+                        state.end_reason = "开播了，另起一条记录"
                     state.begin_session(new_live=True)
                     events.append(("log", "info", f"[{name}] 开播了，开始发送弹幕{self._story_hint(state)}"))
                     events.append(("notify", f"{name} 开播了", "已开始自动发送弹幕"))
@@ -424,7 +443,9 @@ class Engine(QObject):
                 if state.offline_streak >= OFFLINE_CONFIRM_COUNT:  # 下播
                     state.live = False
                     count = state.sent_count
+                    state.end_reason = "下播"
                     if state.cfg.send_when_offline:
+                        state.end_reason = "下播了，按设置继续发送（另起一条记录）"
                         state.begin_session()
                         events.append(("log", "info", f"[{name}] 下播了（本场共发 {count} 条），按设置未开播时继续发送"))
                         events.append(("notify", f"{name} 下播了", "按设置未开播时继续发送弹幕"))
@@ -479,6 +500,7 @@ class Engine(QObject):
         for item in pending:
             if self._stop.is_set() or self._paused or self._creds is not creds:
                 return
+            sent_at = time.time()
             try:
                 result = bili_api.send_danmaku(session, creds, item.room_id, item.text)
                 if result.outcome is SendOutcome.ERROR and bili_api.get_account_info(session, creds) is None:
@@ -486,7 +508,7 @@ class Engine(QObject):
                     result = SendResult(SendOutcome.AUTH_INVALID, result.message, result.code)
             except BiliApiError as e:
                 result = SendResult(SendOutcome.ERROR, str(e))
-            self._handle_send_result(item, result)
+            self._handle_send_result(item, result, sent_at)
 
     def _next_story_item(self, state: _RoomState, events: list[tuple]) -> _Pending | None:
         """说书人模式：切出下一条。说完了按设置停止或从头循环。调用时已持有锁。"""
@@ -505,10 +527,11 @@ class Engine(QObject):
 
     def _finish_story(self, state: _RoomState, events: list[tuple]) -> None:
         state.session = Session.FINISHED
+        state.end_reason = "说书说完了"
         events.append(("log", "info", f"[{state.name}] 说书说完了，停止发送（可以右键“说书从头开始”）"))
         events.append(("notify", f"{state.name} 的说书说完了", "整段文字已经全部发完"))
 
-    def _handle_send_result(self, item: _Pending, result: SendResult) -> None:
+    def _handle_send_result(self, item: _Pending, result: SendResult, sent_at: float | None = None) -> None:
         events: list[tuple] = []
         stamp = time.strftime("%H:%M:%S")
         outcome = result.outcome
@@ -517,6 +540,7 @@ class Engine(QObject):
             state = self._rooms.get(item.room_id)
             if state is None:
                 return
+            self._record_result(state, item, result, sent_at or time.time(), events)
             delay = state.cfg.next_delay()
             state.next_send_at = time.monotonic() + delay
             state.last_ok = outcome is SendOutcome.OK
@@ -543,6 +567,7 @@ class Engine(QObject):
                 events.append(("auth_invalid", result.message))
             elif outcome is SendOutcome.MUTED:
                 state.session = Session.MUTED
+                state.end_reason = "被禁言"
                 state.last_result = f"{stamp}  被禁言"
                 events.append(("log", "error", f"[{name}] 发送失败：{result.message}，本场停止发送"))
                 events.append(("notify", f"{name} 的直播间发送失败", f"{result.message}，本场已停止发送"))
@@ -565,6 +590,7 @@ class Engine(QObject):
                     events.append(("log", "error", f"[{name}] 发送失败：{result.message}"))
                 if state.failures >= MAX_CONSECUTIVE_FAILURES:
                     state.session = Session.STOPPED
+                    state.end_reason = f"连续 {state.failures} 次发送失败，自动停发"
                     events.append(("log", "error", f"[{name}] 连续 {state.failures} 次发送失败，本场停止发送"))
                     events.append(("notify", f"{name} 的直播间发送失败", f"连续 {state.failures} 次失败，本场已停止发送"))
 
@@ -578,6 +604,84 @@ class Engine(QObject):
             ):
                 self._finish_story(state, events)
         events.append(("changed", item.room_id))
+        self._dispatch(events)
+
+    # ------------------------------------------------------------ 历史记录
+
+    def _record_result(self, state: _RoomState, item: _Pending, result: SendResult, at: float, events: list[tuple]) -> None:
+        """把一次发送结果记进历史记录；这一轮的第一条发送时新开一条记录。调用时已持有锁。"""
+        if self._history is None:
+            return
+        try:
+            if state.record_id is not None and state.record_gen != state.generation:
+                self._close_record(state, at, events)  # 已经换成新的一轮了
+            if state.record_id is None:
+                content = state.cfg.story_title if state.is_story else state.cfg.message
+                state.record_id = self._history.open_session(state.cfg.room_id, state.name, state.cfg.mode, content, at)
+                state.record_gen = state.generation
+                state.end_reason = ""
+                events.append(("history",))
+            self._history.add_result(
+                state.record_id, state.cfg.room_id, state.name, at, result.outcome.value, result.message, item.text
+            )
+        except Exception:  # 记录写不进去不能影响发弹幕
+            log.exception("写历史记录失败")
+            return
+        if result.outcome is SendOutcome.FILTERED:
+            events.append(("filtered_csv",))
+
+    def _record_active(self, state: _RoomState) -> bool:
+        return (
+            state.cfg.enabled
+            and state.session is Session.SENDING
+            and state.generation == state.record_gen
+            and not self._paused
+            and self._creds is not None
+        )
+
+    def _end_reason(self, state: _RoomState) -> str:
+        if state.end_reason:
+            return state.end_reason
+        if not state.cfg.enabled:
+            return "停用了这个直播间"
+        if self._paused:
+            return "暂停监控"
+        if self._creds is None:
+            return "登录失效或退出登录"
+        return "停止发送"
+
+    def _close_record(self, state: _RoomState, at: float, events: list[tuple], reason: str = "") -> None:
+        """结束这个直播间正在记的历史记录。调用时已持有锁。"""
+        record_id, state.record_id = state.record_id, None
+        try:
+            self._history.close_session(record_id, at, reason or self._end_reason(state))
+        except Exception:
+            log.exception("写历史记录失败")
+        state.end_reason = ""
+        events.append(("history",))
+
+    def _check_records(self) -> None:
+        """已经停止发送的直播间，把它的历史记录结束掉。后台线程每一轮都检查一次。"""
+        if self._history is None:
+            return
+        events: list[tuple] = []
+        with self._lock:
+            now = time.time()
+            for state in self._rooms.values():
+                if state.record_id is not None and not self._record_active(state):
+                    self._close_record(state, now, events)
+        self._dispatch(events)
+
+    def close_records(self, reason: str) -> None:
+        """程序退出或更新前调用：结束所有还在记的历史记录。"""
+        if self._history is None:
+            return
+        events: list[tuple] = []
+        with self._lock:
+            now = time.time()
+            for state in self._rooms.values():
+                if state.record_id is not None:
+                    self._close_record(state, now, events, reason)
         self._dispatch(events)
 
     # ------------------------------------------------------------ 信号
@@ -601,3 +705,15 @@ class Engine(QObject):
             elif kind == "auth_invalid":
                 self._emit_log("error", f"登录已失效（{event[1]}），已停止发送，请重新登录")
                 self.auth_invalid.emit(event[1])
+            elif kind == "history":
+                self.history_changed.emit()
+            elif kind == "filtered_csv":
+                self._write_filtered_csv()
+
+    def _write_filtered_csv(self) -> None:
+        try:
+            self._history.write_filtered_csv()
+        except PermissionError:
+            pass  # 整理表正被 Excel 打开着，下次有新的被过滤弹幕、或在历史记录页打开整理表时再写
+        except OSError as e:
+            log.warning("更新屏蔽词整理表失败：%s", e)

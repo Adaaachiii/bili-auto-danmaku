@@ -1,4 +1,4 @@
-"""主窗口：左侧功能栏（直播间、弹幕收藏夹、设置、账号），右侧对应页面，以及右下角托盘图标。"""
+"""主窗口：左侧功能栏（直播间、弹幕收藏夹、历史记录、设置、账号），右侧对应页面，以及右下角托盘图标。"""
 
 from __future__ import annotations
 
@@ -6,6 +6,7 @@ import html
 import logging
 import sys
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 from PySide6.QtCore import QLibraryInfo, QLocale, QPoint, QSize, Qt, QTimer, QTranslator
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPixmap
@@ -16,6 +17,7 @@ from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
     QDialog,
+    QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -26,6 +28,7 @@ from PySide6.QtWidgets import (
     QMenu,
     QMessageBox,
     QPlainTextEdit,
+    QProgressDialog,
     QPushButton,
     QSplitter,
     QStackedWidget,
@@ -36,7 +39,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import bili_api, secure_store, story, system
+from . import bili_api, secure_store, story, system, updater
 from .bili_api import AccountInfo, Credentials
 from .config import (
     APP_ID,
@@ -54,6 +57,7 @@ from .config import (
 )
 from .engine import Engine, RoomView, Session
 from .favorites import FavoritesStore
+from .history import HistoryStore
 from .ui_common import (
     NoFocusDelegate,
     StatusColors,
@@ -65,6 +69,7 @@ from .ui_common import (
 )
 from .ui_dialogs import LoginDialog, fetch_account
 from .ui_favorites import FavoritesPage
+from .ui_history import HistoryPage
 from .ui_room_dialog import RoomDialog
 from .ui_settings import SettingsPage
 
@@ -75,7 +80,7 @@ COL_ENABLED, COL_NAME, COL_ROOM, COL_STATUS, COL_MESSAGE, COL_INTERVAL, COL_SENT
 
 SESSION_HINT = "只影响当前这一段（这场直播，或这次未开播期间），开播或下播后照常自动处理"
 
-PAGE_ROOMS, PAGE_FAVORITES, PAGE_SETTINGS = range(3)
+PAGE_ROOMS, PAGE_FAVORITES, PAGE_HISTORY, PAGE_SETTINGS = range(4)
 AVATAR_SIZE = 36
 
 
@@ -94,6 +99,9 @@ class MainWindow(QMainWindow):
         self.cfg = load_config()
         self.colors = StatusColors()
         self.favorites = FavoritesStore()
+        self.history = HistoryStore()
+        # 上次程序没正常退出时还在记的历史记录，按最后一次发送的时间结束掉
+        self.history.close_unfinished("程序异常退出")
         self.creds: Credentials | None = None
         self.account: AccountInfo | None = None
         self._avatar: QPixmap | None = None
@@ -102,7 +110,7 @@ class MainWindow(QMainWindow):
         self._tray_hint_shown = False
         self._updating_table = False
 
-        self.engine = Engine(self.cfg.poll_interval_sec, self.cfg.on_start_live)
+        self.engine = Engine(self.cfg.poll_interval_sec, self.cfg.on_start_live, history=self.history)
         self.engine.room_changed.connect(self._on_room_changed)
         self.engine.log_message.connect(self._append_log)
         self.engine.notify.connect(self._notify)
@@ -140,10 +148,14 @@ class MainWindow(QMainWindow):
         self.pages = QStackedWidget()
         rooms_page = QWidget()
         self.favorites_page = FavoritesPage(self.favorites)
+        self.history_page = HistoryPage(self.history)
+        self.engine.history_changed.connect(self.history_page.refresh_if_visible)
         self.settings_page = SettingsPage()
         self.settings_page.saved.connect(self._save_settings)
+        self.settings_page.update_requested.connect(self._update_from_zip)
         self.pages.addWidget(rooms_page)
         self.pages.addWidget(self.favorites_page)
+        self.pages.addWidget(self.history_page)
         self.pages.addWidget(self.settings_page)
 
         outer.addWidget(self._build_sidebar())
@@ -325,6 +337,7 @@ class MainWindow(QMainWindow):
 
         self.nav_rooms = nav_button("直播间", PAGE_ROOMS)
         self.nav_favorites = nav_button("弹幕收藏夹", PAGE_FAVORITES)
+        self.nav_history = nav_button("历史记录", PAGE_HISTORY)
         self.nav_settings = nav_button("设置", PAGE_SETTINGS)
         self.nav_group.idClicked.connect(self._show_page)
         self.nav_rooms.setChecked(True)
@@ -345,6 +358,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(brand)
         layout.addWidget(self.nav_rooms)
         layout.addWidget(self.nav_favorites)
+        layout.addWidget(self.nav_history)
         layout.addStretch(1)
         layout.addWidget(self.nav_settings)
         layout.addSpacing(6)
@@ -379,7 +393,7 @@ class MainWindow(QMainWindow):
         self.tray_pause_action = QAction("暂停监控", menu)
         self.tray_pause_action.triggered.connect(self._toggle_pause)
         quit_action = QAction("退出", menu)
-        quit_action.triggered.connect(self.quit_app)
+        quit_action.triggered.connect(lambda: self.quit_app())  # triggered 会带一个参数，不能直接连
         menu.addAction(show_action)
         menu.addAction(self.tray_pause_action)
         menu.addSeparator()
@@ -1031,10 +1045,74 @@ class MainWindow(QMainWindow):
             self._save_config()
         return choice
 
-    def quit_app(self) -> None:
+    # ------------------------------------------------------------ 从压缩包更新
+
+    def _update_from_zip(self) -> None:
+        downloads = Path.home() / "Downloads"
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择新版本的压缩包", str(downloads if downloads.exists() else Path.home()), "压缩包 (*.zip)"
+        )
+        if not path:
+            return
+        progress = QProgressDialog("正在解压新版本……", "", 0, 0, self)
+        progress.setWindowTitle(APP_TITLE)
+        progress.setCancelButton(None)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.show()
+        target = updater.app_dir()
+
+        def on_done(staged: updater.StagedUpdate) -> None:
+            progress.close()
+            self._confirm_update(staged, target)
+
+        def on_error(message: str) -> None:
+            progress.close()
+            updater.discard(target)
+            QMessageBox.warning(self, "没法更新", message)
+
+        run_async(self, updater.prepare_from_zip, Path(path), target, on_done=on_done, on_error=on_error)
+
+    def _confirm_update(self, staged: updater.StagedUpdate, target: Path) -> None:
+        if updater.version_tuple(staged.version) <= updater.version_tuple(APP_VERSION):
+            same = staged.version == APP_VERSION
+            question = f"压缩包里是 {staged.version}，{'和现在的版本一样' if same else '比现在的 ' + APP_VERSION + ' 还旧'}，仍要替换吗？"
+        else:
+            question = f"从 {APP_VERSION} 更新到 {staged.version}？"
+        sending = any(view and view.session is Session.SENDING for view in (self.engine.view(r.room_id) for r in self.cfg.rooms))
+        detail = "程序会关闭并自动重新打开，直播间、收藏夹、历史记录等数据不受影响。"
+        if sending:
+            detail += "\n正在发送的直播间会中断十几秒，重新打开后照常处理。"
+        answer = QMessageBox.question(self, "从压缩包更新", f"{question}\n\n{detail}")
+        if answer != QMessageBox.StandardButton.Yes:
+            updater.discard(target)
+            return
+        try:
+            updater.launch_install(staged, target)
+        except OSError as e:
+            updater.discard(target)
+            QMessageBox.warning(self, "没法更新", f"启动新版本失败：{e}")
+            return
+        self.quit_app("程序更新")
+
+    def after_update(self, old_version: str) -> None:
+        """更新完重新打开后调用：删掉临时文件，告诉用户已经更新。"""
+        self._log("info", f"已从 {old_version} 更新到 {APP_VERSION}")
+        self._notify("更新完成", f"已从 {old_version} 更新到 {APP_VERSION}")
+
+        def cleanup(attempts_left: int = 5) -> None:
+            # 刚才负责替换文件的新版进程可能还没完全退出，删不掉就过几秒再试
+            if not updater.cleanup(updater.app_dir()) and attempts_left > 1:
+                QTimer.singleShot(5000, lambda: cleanup(attempts_left - 1))
+
+        QTimer.singleShot(3000, cleanup)
+
+    def quit_app(self, reason: str = "程序退出") -> None:
         self._quitting = True
         self.engine.stop()
+        self.engine.close_records(reason)  # 还在发送的直播间，历史记录记到这一刻为止
         self.favorites.close()
+        self.history.close()
         if self.tray:
             self.tray.hide()
         QApplication.quit()
@@ -1115,6 +1193,10 @@ def run(argv: list[str]) -> int:
         window.show_window()
 
     server.newConnection.connect(on_new_connection)
+
+    if "--updated-from" in argv:
+        index = argv.index("--updated-from")
+        window.after_update(argv[index + 1] if index + 1 < len(argv) else "旧版本")
 
     if "--minimized" in argv and window.tray is not None:
         if window.creds is None:

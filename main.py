@@ -3,6 +3,7 @@
 运行：打包好的版本双击“B站弹幕自动化.exe”；源码版双击“启动.cmd”
 （运行环境在 %USERPROFILE%\\.venvs\\bili-auto-danmaku，原因见启动.cmd 开头的说明）。
 加上 --minimized 参数会直接缩小到托盘（开机自启用的就是这个）。
+--install-update 是“从压缩包更新”时内部用的（见 app/updater.py）。
 """
 
 import sys
@@ -28,6 +29,10 @@ def _report_startup_error() -> None:
 
 
 if __name__ == "__main__":
+    if sys.argv[1:2] == ["--install-update"]:  # 从压缩包更新：解压出来的新版本在替换程序文件，不打开界面
+        from app.updater import install_main
+
+        sys.exit(install_main(sys.argv[2:]))
     try:
         from app.ui_main import run
 
