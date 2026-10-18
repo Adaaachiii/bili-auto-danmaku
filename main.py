@@ -6,6 +6,7 @@
 --install-update 是“从压缩包更新”时内部用的（见 app/updater.py）。
 """
 
+import os
 import sys
 import traceback
 from pathlib import Path
@@ -17,12 +18,18 @@ def _report_startup_error() -> None:
         folder = Path(sys.executable).resolve().parent
     else:
         folder = Path(__file__).resolve().parent
-    error_file = folder / "启动错误.txt"
-    try:
-        error_file.write_text(traceback.format_exc(), encoding="utf-8")
-        where = f"错误信息已保存到：\n{error_file}\n\n请把这个文件发给我。"
-    except OSError:
-        where = traceback.format_exc(limit=3)
+    # 程序文件夹写不进去（比如在 C:\Program Files）就存到 %LOCALAPPDATA%\BiliAutoDanmaku
+    local = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "BiliAutoDanmaku"
+    where = traceback.format_exc(limit=3)
+    for candidate in (folder, local):
+        error_file = candidate / "启动错误.txt"
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            error_file.write_text(traceback.format_exc(), encoding="utf-8")
+        except OSError:
+            continue
+        where = f"错误信息已保存到：\n{error_file}\n\n反馈问题时请附上这个文件。"
+        break
     import ctypes
 
     ctypes.windll.user32.MessageBoxW(None, f"程序启动失败。{where}", "B站弹幕自动化", 0x10)

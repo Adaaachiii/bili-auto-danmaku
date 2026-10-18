@@ -3,6 +3,7 @@
 运行：python tests/test_updater.py（用假的程序文件夹，不碰真实安装）。
 打包过（dist 里有压缩包）的话，顺便检查真实压缩包能不能通过检查。
 """
+import os
 import shutil
 import sys
 import tempfile
@@ -12,6 +13,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 (ROOT / ".test").mkdir(exist_ok=True)
 WORK = Path(tempfile.mkdtemp(dir=ROOT / ".test"))
+os.environ.pop("BILI_AUTO_DANMAKU_HOME", None)
+os.environ["LOCALAPPDATA"] = str(WORK / "localappdata")  # 不碰真实的 %LOCALAPPDATA%
 sys.path.insert(0, str(ROOT))
 
 from app import updater  # noqa: E402
@@ -69,6 +72,16 @@ assert (target / "_internal" / "only_in_old.txt").exists()
 assert (target / "data" / "config.json").read_text(encoding="utf-8") == "我的数据"
 assert started[-1] == [] and "已恢复旧版本" in messages[-1], (started, messages)
 print("出错恢复旧版本 OK")
+
+# ---- 数据在 %LOCALAPPDATA% 的话（程序文件夹里没有 data）：更新记录写到那边，不在程序文件夹里另起一个 data
+target, source = make_dirs("local-data")
+shutil.rmtree(target / "data")
+local = WORK / "localappdata" / "BiliAutoDanmaku"
+write(local / "config.json", "我的数据")
+assert updater.install_main([str(target), dead_pid, "1.0.0"], source=source) == 0, messages
+assert "文件替换完成" in (local / "logs" / "update.log").read_text(encoding="utf-8")
+assert not (target / "data").exists()
+print("数据在 LOCALAPPDATA OK")
 
 # ---- 检查压缩包：缺 exe、路径不正常、exe 不是本程序
 def make_zip(name: str, entries: dict[str, bytes]) -> Path:

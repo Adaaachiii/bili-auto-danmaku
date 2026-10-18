@@ -44,6 +44,7 @@ class SettingsPage(QWidget):
 
     saved = Signal()
     update_requested = Signal()  # 点了“从压缩包更新”
+    notice_requested = Signal()  # 点了“使用须知”
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -108,14 +109,21 @@ class SettingsPage(QWidget):
         box.addSpacing(12)
         box.addLayout(folder_row)
         version_row = QHBoxLayout()
-        version_row.addWidget(hint_label(f"{APP_TITLE} {APP_VERSION}"))
+        version_label = hint_label(f"{APP_TITLE} {APP_VERSION}")
+        version_label.setWordWrap(False)
+        version_row.addWidget(version_label)
         if getattr(sys, "frozen", False):
             update_btn = QPushButton("从压缩包更新…")
             update_btn.setToolTip("选择从 GitHub Releases 下载的新版本压缩包，程序会自动替换并重新打开，数据不受影响")
             update_btn.clicked.connect(self.update_requested.emit)
             version_row.addWidget(update_btn)
         else:
-            version_row.addWidget(hint_label("（源码版，用 git pull 更新）"))
+            source_hint = hint_label("（源码版，用 git pull 更新）")
+            source_hint.setWordWrap(False)
+            version_row.addWidget(source_hint)
+        notice_btn = QPushButton("使用须知")
+        notice_btn.clicked.connect(self.notice_requested.emit)
+        version_row.addWidget(notice_btn)
         version_row.addStretch(1)
         box.addLayout(version_row)
 

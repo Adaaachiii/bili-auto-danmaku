@@ -1,6 +1,6 @@
 """配置文件读写。
 
-直播间列表和各项设置保存在程序文件夹下的 data\\config.json，日志在 data\\logs。
+直播间列表和各项设置保存在数据文件夹（一般是程序文件夹下的 data，见 data_dir）的 config.json，日志在 logs。
 说书用的长文字不放这里（这个文件每次改设置都要整体重写），见 story.py。
 登录 Cookie 也不在这里，由 secure_store.py 存进 Windows 凭据管理器。
 """
@@ -11,13 +11,14 @@ import json
 import logging
 import os
 import random
+import shutil
 import sys
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 
 APP_ID = "BiliAutoDanmaku"  # 凭据管理器、开机启动项用这个名字，改了会丢登录，所以不跟着程序名改
 APP_TITLE = "B站弹幕自动化"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 
 # 发送间隔（秒）。设下限是因为发得太快会被 B 站限流，也容易被房管禁言。
 MIN_SEND_INTERVAL = 5
@@ -65,16 +66,79 @@ def _program_dir() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-def data_dir() -> Path:
-    """配置和日志所在的文件夹：程序文件夹下的 data。
+def fallback_data_dir() -> Path:
+    """程序文件夹写不进去时（比如放在 C:\\Program Files）改用的数据文件夹。"""
+    base = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+    return Path(base) / APP_ID
 
-    不放在 %APPDATA% 是因为有的环境不允许程序往用户目录写文件，放在自己文件夹里最稳。
-    设置环境变量 BILI_AUTO_DANMAKU_HOME 可以换位置（测试用）。
+
+def _writable(folder: Path) -> bool:
+    """真的写一个文件试试。Windows 上 os.access 看不出文件夹权限。"""
+    probe = folder / f".write-test-{os.getpid()}"
+    try:
+        probe.write_bytes(b"")
+        probe.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def resolve_data_dir(program: Path, fallback: Path) -> tuple[Path, str]:
+    """决定数据放在哪，返回（文件夹, 给日志看的说明）。
+
+    优先用程序文件夹下的 data，换电脑时整个文件夹带走就行；
+    写不进去就改用 fallback（%LOCALAPPDATA%\\BiliAutoDanmaku）。
+    以前已经存在 fallback 里的数据会接着用，不会因为换了程序文件夹就“丢了”直播间。
     """
+    portable = program / "data"
+    if portable.is_dir():
+        if _writable(portable):
+            return portable, ""
+        if fallback.exists():
+            fallback.mkdir(parents=True, exist_ok=True)
+            return fallback, f"{portable} 不能写入，改用 {fallback}（这里面已有数据，没有从程序文件夹复制）"
+        try:  # 第一次换位置：把程序文件夹里的旧数据复制过来，直播间、收藏夹照常可用
+            shutil.copytree(portable, fallback, ignore=shutil.ignore_patterns("*.tmp", ".write-test-*"))
+            return fallback, f"{portable} 不能写入，已把里面的数据复制到 {fallback}，以后保存在这里"
+        except OSError as e:
+            fallback.mkdir(parents=True, exist_ok=True)
+            return fallback, f"{portable} 不能写入，改用 {fallback}；复制旧数据失败：{e}"
+    if fallback.is_dir():
+        return fallback, ""
+    try:
+        portable.mkdir(parents=True)
+    except OSError:
+        pass
+    else:
+        if _writable(portable):
+            return portable, ""
+        shutil.rmtree(portable, ignore_errors=True)
+    fallback.mkdir(parents=True, exist_ok=True)
+    return fallback, f"程序文件夹 {program} 不能写入，数据保存在 {fallback}"
+
+
+def data_dir_for(program: Path) -> tuple[Path, str]:
+    """program 这个程序文件夹对应的数据文件夹。设置环境变量 BILI_AUTO_DANMAKU_HOME 可以换位置（测试用）。"""
     override = os.environ.get("BILI_AUTO_DANMAKU_HOME")
-    path = Path(override) if override else _program_dir() / "data"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+    if override:
+        path = Path(override)
+        path.mkdir(parents=True, exist_ok=True)
+        return path, ""
+    return resolve_data_dir(program, fallback_data_dir())
+
+
+_data_dir: Path | None = None
+data_dir_note = ""  # 数据没放在程序文件夹时的说明，启动后写进日志
+
+
+def data_dir() -> Path:
+    """配置、收藏夹、历史记录和日志所在的文件夹。"""
+    if os.environ.get("BILI_AUTO_DANMAKU_HOME"):
+        return data_dir_for(_program_dir())[0]
+    global _data_dir, data_dir_note
+    if _data_dir is None:  # 只判断一次，免得运行中途换位置
+        _data_dir, data_dir_note = data_dir_for(_program_dir())
+    return _data_dir
 
 
 def config_path() -> Path:
@@ -129,6 +193,7 @@ class AppConfig:
     browser: str = BROWSER_EDGE
     close_action: str = CLOSE_ASK
     notify: bool = True
+    notice_shown: bool = False  # 第一次打开窗口时弹出的“使用须知”看过没有
 
     def find_room(self, room_id: int) -> RoomConfig | None:
         return next((room for room in self.rooms if room.room_id == room_id), None)

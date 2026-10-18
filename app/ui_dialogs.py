@@ -1,4 +1,4 @@
-"""登录对话框：扫码登录或粘贴 Cookie。"""
+"""登录对话框（扫码登录或粘贴 Cookie）和使用须知。"""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QTabWidget,
@@ -22,6 +23,30 @@ from .ui_common import StatusColors, qr_pixmap, run_async, set_colored
 
 def fetch_account(creds: Credentials) -> AccountInfo | None:
     return bili_api.get_account_info(bili_api.new_session(), creds)
+
+
+# ---------------------------------------------------------------- 使用须知
+
+NOTICE_TEXT = (
+    "本程序是个人开发的第三方工具，和哔哩哔哩（B 站）官方没有任何关系，也没有得到 B 站的授权或认可。\n\n"
+    "• 自动发送弹幕可能违反 B 站的用户协议和社区规范，账号可能被限流、禁言甚至封禁。风险由使用者自己承担。\n"
+    "• 请只在主播同意的直播间或你自己的直播间使用。不要用来刷屏、骚扰主播和其他观众，"
+    "不要发送违法违规或侵犯他人权益的内容（包括未经授权转发受版权保护的文字）。\n"
+    "• 程序用的是 B 站网页版自己的接口，没有公开文档，随时可能失效。\n"
+    "• 本程序按“原样”提供，作者不对使用它造成的任何后果负责。\n\n"
+    "以后可以在“设置”页最下面再次打开这段说明。"
+)
+
+
+def show_notice(parent: QWidget | None) -> None:
+    """第一次打开程序时，以及在设置页点“使用须知”时显示。"""
+    box = QMessageBox(parent)
+    box.setWindowTitle("使用须知")
+    box.setIcon(QMessageBox.Icon.Information)
+    box.setText("使用前请先看一下")
+    box.setInformativeText(NOTICE_TEXT)
+    box.addButton("我知道了", QMessageBox.ButtonRole.AcceptRole)
+    box.exec()
 
 
 # ---------------------------------------------------------------- 登录

@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import bili_api, secure_store, story, system, updater
+from . import bili_api, config, secure_store, story, system, updater
 from .bili_api import AccountInfo, Credentials
 from .config import (
     APP_ID,
@@ -67,7 +67,7 @@ from .ui_common import (
     make_app_icon,
     run_async,
 )
-from .ui_dialogs import LoginDialog, fetch_account
+from .ui_dialogs import LoginDialog, fetch_account, show_notice
 from .ui_favorites import FavoritesPage
 from .ui_history import HistoryPage
 from .ui_room_dialog import RoomDialog
@@ -108,6 +108,7 @@ class MainWindow(QMainWindow):
         self._account_state = "none"
         self._quitting = False
         self._tray_hint_shown = False
+        self._notice_pending = False
         self._updating_table = False
 
         self.engine = Engine(self.cfg.poll_interval_sec, self.cfg.on_start_live, history=self.history)
@@ -153,6 +154,7 @@ class MainWindow(QMainWindow):
         self.settings_page = SettingsPage()
         self.settings_page.saved.connect(self._save_settings)
         self.settings_page.update_requested.connect(self._update_from_zip)
+        self.settings_page.notice_requested.connect(lambda: show_notice(self))
         self.pages.addWidget(rooms_page)
         self.pages.addWidget(self.favorites_page)
         self.pages.addWidget(self.history_page)
@@ -996,6 +998,18 @@ class MainWindow(QMainWindow):
         self.raise_()
         self.activateWindow()
 
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        # 第一次打开窗口时弹一次“使用须知”（开机自启缩在托盘时不弹，等第一次打开窗口）
+        if not self.cfg.notice_shown and not self._notice_pending:
+            self._notice_pending = True
+            QTimer.singleShot(300, self._show_notice_once)
+
+    def _show_notice_once(self) -> None:
+        show_notice(self)
+        self.cfg.notice_shown = True
+        self._save_config()
+
     def _on_tray_activated(self, reason) -> None:
         if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
             self.show_window()
@@ -1017,7 +1031,7 @@ class MainWindow(QMainWindow):
                 self._tray_hint_shown = True
                 self.tray.showMessage(
                     APP_TITLE,
-                    "程序还在后台运行。点任务栏右下角的图标可以打开窗口或退出；没看到图标的话，点那里的 ^ 展开。",
+                    "程序仍在运行中，已最小化到托盘",
                     make_app_icon(),
                     6000,
                 )
@@ -1176,7 +1190,9 @@ def run(argv: list[str]) -> int:
     server.listen(SINGLE_INSTANCE_KEY)
 
     _setup_logging()
-    log.info("%s %s 启动", APP_TITLE, APP_VERSION)
+    log.info("%s %s 启动，数据文件夹：%s", APP_TITLE, APP_VERSION, data_dir())
+    if config.data_dir_note:
+        log.warning(config.data_dir_note)
     if not translated:
         log.warning("没找到 Qt 的中文翻译，右键菜单等会显示英文")
     try:

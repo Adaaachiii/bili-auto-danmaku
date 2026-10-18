@@ -6,7 +6,8 @@
    中途出错就把旧文件挪回去，旧版本照样能用；
 4. 新版本启动后删掉 _update。
 
-data 文件夹（直播间、收藏夹、历史记录等）全程不碰。
+data 文件夹（直播间、收藏夹、历史记录等）全程不碰。程序文件夹不能写入时（比如放在 C:\\Program Files）没法用这个功能，
+第 1 步就会提示。
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from ctypes import wintypes
 from dataclasses import dataclass
 from pathlib import Path
 
-from .config import APP_TITLE, APP_VERSION
+from .config import APP_TITLE, APP_VERSION, data_dir_for
 
 EXE_NAME = f"{APP_TITLE}.exe"
 UPDATE_DIR = "_update"
@@ -106,7 +107,10 @@ def prepare_from_zip(zip_path: Path, target: Path) -> StagedUpdate:
             shutil.rmtree(staging, ignore_errors=True)
             folder.mkdir(parents=True)
         except OSError as e:
-            raise UpdateError(f"程序所在的文件夹不能写入，没法自动更新：{e}\n可以把程序文件夹挪到 D 盘等有写入权限的位置。") from e
+            raise UpdateError(
+                f"程序所在的文件夹不能写入，没法自动更新：{e}\n"
+                "可以退出程序，把整个程序文件夹挪到 D 盘等有写入权限的位置再更新。"
+            ) from e
         root = folder.resolve()
         try:
             for name in names:
@@ -155,7 +159,10 @@ def launch_install(staged: StagedUpdate, target: Path, wait_pid: int | None = No
 def install_main(args: list[str], source: Path | None = None) -> int:
     """参数：程序文件夹、旧程序的进程号、旧版本号。source 是新版本所在的文件夹，默认就是自己所在的文件夹。"""
     target, wait_pid, old_version = Path(args[0]), int(args[1]), args[2]
-    log_file = target / "data" / "logs" / "update.log"
+    try:  # 和程序用同一个数据文件夹（不一定在程序文件夹里，见 config.resolve_data_dir）
+        log_file = data_dir_for(target)[0] / "logs" / "update.log"
+    except OSError:
+        log_file = target / UPDATE_DIR / "update.log"
 
     def log(text: str) -> None:
         try:
