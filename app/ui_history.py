@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from .config import MODE_STORY
-from .history import FILTERED_CSV_NAME, OUTCOME_LABELS, HistoryStore, SessionRecord
+from .history import FILTERED_CSV_NAME, HistoryStore, SessionRecord
 from .ui_common import NoFocusDelegate, StatusColors, hint_label, utc_offset_label
 
 REFRESH_MS = 5000  # 页面开着时，进行中的记录每隔这么久刷新一次
@@ -239,8 +239,8 @@ class HistoryPage(QWidget):
         if record is None:
             return
         failures = self.store.failures(record.id)
-        reasons = Counter(f.outcome for f in failures)
-        reason_text = "，".join(f"{OUTCOME_LABELS.get(o, o)} {n} 条" for o, n in reasons.most_common())
+        reasons = Counter(f.category for f in failures)
+        reason_text = "，".join(f"{category} {n} 条" for category, n in reasons.most_common())
         end = "还在发送" if record.ongoing else f"{_time_text(record.ended_at, '%Y-%m-%d %H:%M:%S')}（{record.end_reason}）"
         self.summary.setText(
             f"<b>{record.uname}</b>（房间 {record.room_id}）　"

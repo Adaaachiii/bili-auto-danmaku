@@ -87,7 +87,7 @@ assert r and not r.ongoing and r.end_reason == "下播", r
 assert (r.sent, r.ok, r.failed) == (4, 2, 2), r
 assert round(r.duration()) == 6.5 * 60, r.duration()
 fails = store.failures(r.id)
-assert [f.reason for f in fails] == ["被 B 站过滤（f）", "被限流（msg in 1s）"], [f.reason for f in fails]
+assert [f.reason for f in fails] == ["系统屏蔽（f）", "被限流（msg in 1s）"], [f.reason for f in fails]
 assert all(f.text == "独轮车测试" for f in fails)
 print("A 下播结束、统计、失败原因 OK")
 
@@ -103,7 +103,7 @@ assert store.filtered_count() == 1  # 同一直播间同样的内容合并成一
 path = store.write_filtered_csv()
 with open(path, encoding="utf-8-sig", newline="") as f:
     rows = list(csv.reader(f))
-assert rows[0][:4] == ["弹幕内容", "主播", "房间号", "被过滤次数"] and rows[1][:5] == ["独轮车测试", "测试主播", "1", "2", "k"], rows
+assert rows[0][:5] == ["弹幕内容", "主播", "房间号", "被过滤次数", "屏蔽类型"] and rows[1][:5] == ["独轮车测试", "测试主播", "1", "2", "主播屏蔽（k）"], rows
 assert open(path, "rb").read(3) == b"\xef\xbb\xbf"  # 带 BOM，Excel 打开不乱码
 print("B 不到 5 分钟不保存、整理表合并计数 OK")
 

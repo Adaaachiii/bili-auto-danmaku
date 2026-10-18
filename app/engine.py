@@ -574,10 +574,11 @@ class Engine(QObject):
             else:
                 state.failures += 1
                 if outcome is SendOutcome.FILTERED:
-                    state.last_result = f"{stamp}  被过滤（{result.message}）"
+                    kind = bili_api.filter_kind(result.message)
+                    state.last_result = f"{stamp}  {kind}（{result.message}）"
                     skipped = "，这段已跳过" if advanced else ""
                     events.append(
-                        ("log", "warn", f"[{name}] 弹幕被 B 站过滤了（返回：{result.message}），可能含屏蔽词{skipped}：{item.text}")
+                        ("log", "warn", f"[{name}] 弹幕没发出去：{kind}（返回：{result.message}），可能含屏蔽词{skipped}：{item.text}")
                     )
                 elif outcome is SendOutcome.RATE_LIMITED:
                     state.next_send_at = time.monotonic() + delay * 2

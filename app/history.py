@@ -5,7 +5,8 @@
 登录失效、程序退出等。发送不到 5 分钟的记录不保存。
 
 被 B 站过滤的弹幕（通常是含屏蔽词）不管那次发了多久，都另外汇总进“屏蔽词整理表”
-data\\被过滤的弹幕.csv：同一个直播间里同样的内容合并成一行，记被过滤的次数，用 Excel 可以直接打开。
+data\\被过滤的弹幕.csv：同一个直播间里同样的内容合并成一行，记被过滤的次数和屏蔽类型
+（系统屏蔽 / 主播屏蔽），用 Excel 可以直接打开。
 
 引擎线程写、界面线程读，所以每个方法都加了锁。
 """
@@ -20,6 +21,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from .bili_api import filter_kind
 from .config import data_dir
 
 MIN_RECORD_SECONDS = 5 * 60  # 发送不到这么久的记录不保存
@@ -70,9 +72,15 @@ class FailureRecord:
     text: str  # 这条弹幕的内容
 
     @property
+    def category(self) -> str:
+        """失败的类别；被过滤的再分成系统屏蔽 / 主播屏蔽。"""
+        if self.outcome == "filtered":
+            return filter_kind(self.message)
+        return OUTCOME_LABELS.get(self.outcome, self.outcome)
+
+    @property
     def reason(self) -> str:
-        label = OUTCOME_LABELS.get(self.outcome, self.outcome)
-        return f"{label}（{self.message}）" if self.message else label
+        return f"{self.category}（{self.message}）" if self.message else self.category
 
 
 def filtered_csv_path() -> Path:
@@ -247,9 +255,10 @@ class HistoryStore:
         temp = path.with_name(path.name + ".tmp")
         with open(temp, "w", encoding="utf-8-sig", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["弹幕内容", "主播", "房间号", "被过滤次数", "B站返回", "第一次被过滤", "最近一次被过滤"])
+            writer.writerow(["弹幕内容", "主播", "房间号", "被过滤次数", "屏蔽类型", "第一次被过滤", "最近一次被过滤"])
             for text, uname, room_id, count, message, first_at, last_at in rows:
-                writer.writerow([_csv_text(text), uname, room_id, count, message, _stamp(first_at), _stamp(last_at)])
+                kind = f"{filter_kind(message)}（{message}）" if message else filter_kind(message)
+                writer.writerow([_csv_text(text), uname, room_id, count, kind, _stamp(first_at), _stamp(last_at)])
         os.replace(temp, path)
         return path
 

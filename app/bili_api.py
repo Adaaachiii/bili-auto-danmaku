@@ -293,20 +293,40 @@ def send_danmaku(session: requests.Session, creds: Credentials, room_id: int, te
     return classify_send_response(raw.get("code"), str(raw.get("message") or raw.get("msg") or ""))
 
 
+# 发送弹幕接口的返回码。B 站没有公开文档，下面来自社区整理（bilibili-API-collect）和开源项目
+CODE_NOT_LOGGED_IN = -101  # 账号未登录（Cookie 失效）
+CODE_CSRF_FAILED = -111  # csrf 校验失败（Cookie 里的 bili_jct 不对）
+CODE_TOO_FAST = 10031  # 发送频率过快
+CODE_TOO_LONG = 1003212  # 超出长度限制
+# code 是 0 但 msg 不为空：弹幕被拦下了，只有自己看得到。f 是系统（全站）屏蔽词，k 是主播设置的屏蔽词
+FILTER_KINDS = {"f": "系统屏蔽", "k": "主播屏蔽"}
+
+# 没有返回码可认时，再看提示文字。"msg in 1s"（1 秒内发了两条）和 "msg repeat"（短时间重复同一句）是旧接口的说法
 _RATE_LIMIT_HINTS = ("频率", "过快", "重复", "repeat", "in 1s")
 _MUTED_HINTS = ("禁言", "拉黑")
 
 
+def filter_kind(message: str) -> str:
+    """被过滤时 B 站返回的 msg 换成好懂的说法：f → 系统屏蔽，k → 主播屏蔽，认不出来的叫“被 B 站过滤”。"""
+    return FILTER_KINDS.get(message.strip().lower(), "被 B 站过滤")
+
+
 def classify_send_response(code, message: str) -> SendResult:
-    if code == 0:
-        # 被屏蔽词拦下的弹幕也会返回 code 0，但 message 不为空
-        if message.lower() in ("", "ok", "success", "0"):
-            return SendResult(SendOutcome.OK, "", 0)
-        return SendResult(SendOutcome.FILTERED, message, 0)
-    if code in (-101, -111):
-        return SendResult(SendOutcome.AUTH_INVALID, message or "登录已失效", code)
     lowered = message.lower()
-    if any(hint in lowered for hint in _RATE_LIMIT_HINTS):
+    rate_limited = any(hint in lowered for hint in _RATE_LIMIT_HINTS)
+    if code == 0:
+        if lowered in ("", "ok", "success", "0"):
+            return SendResult(SendOutcome.OK, "", 0)
+        if rate_limited:  # 发太快、重复也可能带着 code 0 返回，这不是屏蔽词的问题
+            return SendResult(SendOutcome.RATE_LIMITED, message, 0)
+        return SendResult(SendOutcome.FILTERED, message, 0)
+    if code in (CODE_NOT_LOGGED_IN, CODE_CSRF_FAILED):
+        return SendResult(SendOutcome.AUTH_INVALID, message or "登录已失效", code)
+    if code == CODE_TOO_FAST:
+        return SendResult(SendOutcome.RATE_LIMITED, message or "发送频率过快", code)
+    if code == CODE_TOO_LONG:
+        return SendResult(SendOutcome.ERROR, f"弹幕超出长度限制，请把每条字数调小（{message or f'错误码 {code}'}）", code)
+    if rate_limited:
         return SendResult(SendOutcome.RATE_LIMITED, message, code)
     if any(hint in message for hint in _MUTED_HINTS):
         return SendResult(SendOutcome.MUTED, message, code)

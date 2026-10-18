@@ -17,7 +17,7 @@ from pathlib import Path
 
 APP_ID = "BiliAutoDanmaku"  # 凭据管理器、开机启动项用这个名字，改了会丢登录，所以不跟着程序名改
 APP_TITLE = "B站弹幕自动化"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 
 # 发送间隔（秒）。设下限是因为发得太快会被 B 站限流，也容易被房管禁言。
 MIN_SEND_INTERVAL = 5
