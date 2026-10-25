@@ -43,6 +43,7 @@ from .config import (
     MODE_NOTIFY,
     MODE_REPEAT,
     MODE_STORY,
+    SUGGESTED_MIN_INTERVAL,
     RoomConfig,
     parse_hhmm,
 )
@@ -742,10 +743,12 @@ class RoomDialog(QDialog):
         for widget in (self.max_label, self.max_spin, self.max_unit):
             widget.setVisible(random_on)
         self.max_spin.setMinimum(self.interval_spin.value())
+        tip = f"建议发送间隔不短于{SUGGESTED_MIN_INTERVAL}秒。短于{SUGGESTED_MIN_INTERVAL}秒时，可能会被B站拦截导致发送失败"
         if random_on:
-            self.interval_hint.setText(f"弹幕发送间隔最短为{MIN_SEND_INTERVAL}秒；每条弹幕在这两个时间之间随机选一个间隔")
-        else:
-            self.interval_hint.setText(f"弹幕发送间隔最短为{MIN_SEND_INTERVAL}秒")
+            tip += "；每条弹幕在这两个时间之间随机选一个间隔"
+        # 设得比建议的短时，提示变成黄色
+        too_fast = self.interval_spin.value() < SUGGESTED_MIN_INTERVAL
+        set_colored(self.interval_hint, tip, self._colors.warn if too_fast else self._colors.muted)
         self._update_estimate()
 
     def _update_limit_widgets(self) -> None:

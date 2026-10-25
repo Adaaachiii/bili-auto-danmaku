@@ -21,8 +21,10 @@ APP_ID = "BiliAutoDanmaku"  # 凭据管理器、开机启动项用这个名字�
 APP_TITLE = "B站弹幕自动化"
 APP_VERSION = "1.3.1"
 
-# 发送间隔（秒）。设下限是因为发得太快会被 B 站限流，也容易被房管禁言。
-MIN_SEND_INTERVAL = 5
+# 发送间隔（秒）。B 站自己会拦“1 秒内发两条”，所以最短 1 秒；
+# 建议不短于 5 秒：发得太快容易被限流，也容易被房管禁言，设得更短时界面上会提醒。
+MIN_SEND_INTERVAL = 1
+SUGGESTED_MIN_INTERVAL = 5
 MAX_SEND_INTERVAL = 3600
 DEFAULT_SEND_INTERVAL = 15
 # 检测开播的间隔（秒）。查得太勤可能被风控。

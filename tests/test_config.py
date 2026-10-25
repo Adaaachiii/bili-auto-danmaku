@@ -136,5 +136,14 @@ del os.environ["BILI_AUTO_DANMAKU_HOME"]
 assert config.fallback_data_dir() == WORK / "localappdata" / config.APP_ID
 print("环境变量 OK")
 
+# ---- 发送间隔最短 1 秒（建议 5 秒，界面上提醒）：1 秒照存，0 秒拉回 1 秒
+cfg = config.AppConfig(rooms=[config.RoomConfig(room_id=1, interval_sec=1, interval_max_sec=0),
+                              config.RoomConfig(room_id=2, interval_sec=0)])
+config._normalize(cfg)
+assert (cfg.rooms[0].interval_sec, cfg.rooms[0].interval_max_sec) == (1, 1), cfg.rooms[0]
+assert cfg.rooms[1].interval_sec == 1
+assert config.MIN_SEND_INTERVAL == 1 and config.SUGGESTED_MIN_INTERVAL == 5
+print("最短间隔 OK")
+
 shutil.rmtree(WORK, ignore_errors=True)
 print("全部通过")
