@@ -1,16 +1,24 @@
-"""历史记录页面：每次发送的统计，选中一条后在下面列出这次所有失败的弹幕。"""
+"""历史记录页面。
+
+“记录”：每次发送的统计，选中一条后在下面列出这次所有失败的弹幕；
+“统计”：按直播间、按天合计时长、发送量和成功率，以及失败原因分布。
+两页共用上面的直播间和时间范围筛选。
+"""
 
 from __future__ import annotations
 
+import html
 import os
 import time
 from collections import Counter
+from datetime import date, datetime, timedelta
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QDate, Qt, QTimer
 from PySide6.QtGui import QColor, QGuiApplication
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
+    QDateEdit,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -20,31 +28,31 @@ from PySide6.QtWidgets import (
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from .config import MODE_STORY
-from .history import FILTERED_CSV_NAME, HistoryStore, SessionRecord
-from .ui_common import NoFocusDelegate, StatusColors, hint_label, utc_offset_label
+from .history import FILTERED_CSV_NAME, HistoryStore, SessionRecord, StatRow, stats_by_day, stats_by_room, total_stats
+from .ui_common import NoFocusDelegate, StatusColors, format_duration, hint_label, plain_tip, utc_offset_label
 
 REFRESH_MS = 5000  # 页面开着时，进行中的记录每隔这么久刷新一次
 
-
-def format_duration(seconds: float) -> str:
-    """时长写成“1 小时 5 分”“12 分 30 秒”“45 秒”。"""
-    seconds = int(seconds)
-    hours, rest = divmod(seconds, 3600)
-    minutes, secs = divmod(rest, 60)
-    if hours:
-        return f"{hours} 小时 {minutes} 分"
-    if minutes:
-        return f"{minutes} 分 {secs} 秒"
-    return f"{secs} 秒"
+# 时间范围：（显示的文字, 代号）
+RANGES = [("全部时间", "all"), ("今天", "today"), ("最近 7 天", "7"), ("最近 30 天", "30"), ("本月", "month"), ("自定义", "custom")]
 
 
 def _time_text(timestamp: float, fmt: str = "%Y-%m-%d %H:%M") -> str:
     return time.strftime(fmt, time.localtime(timestamp))
+
+
+def _day_start(day: date) -> float:
+    return datetime.combine(day, datetime.min.time()).timestamp()
+
+
+def _rate_text(row: StatRow) -> str:
+    return "—" if row.success_rate is None else f"{row.success_rate:.1%}"
 
 
 def _table(columns: list[str], multi: bool = False) -> QTableWidget:
@@ -64,12 +72,21 @@ def _table(columns: list[str], multi: bool = False) -> QTableWidget:
     return table
 
 
+def _stat_table(first_column: str) -> QTableWidget:
+    table = _table([first_column, "场数", "总时长", "发送", "成功", "失败", "成功率"])
+    header = table.horizontalHeader()
+    for column in range(table.columnCount()):
+        header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+    header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+    return table
+
+
 def _item(text: str, align_right: bool = False, tip: str = "") -> QTableWidgetItem:
     item = QTableWidgetItem(text)
     if align_right:
         item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
     if tip:
-        item.setToolTip(tip)
+        item.setToolTip(plain_tip(tip))
     return item
 
 
@@ -86,7 +103,7 @@ class HistoryPage(QWidget):
         title = QLabel("历史记录")
         title.setStyleSheet("font-size: 11pt; font-weight: bold;")
         self.csv_btn = QPushButton("打开屏蔽词整理表")
-        self.csv_btn.setToolTip(f"所有被 B 站过滤的弹幕，同一直播间同样的内容合并成一行（data\\{FILTERED_CSV_NAME}）")
+        self.csv_btn.setToolTip(f"所有被 B 站过滤的弹幕，同一直播间同样的内容合并成一行（数据文件夹里的 {FILTERED_CSV_NAME}）")
         self.csv_btn.clicked.connect(self._open_csv)
         self.delete_btn = QPushButton("删除记录")
         self.delete_btn.clicked.connect(self._delete)
@@ -97,15 +114,52 @@ class HistoryPage(QWidget):
         bar.addWidget(self.delete_btn)
         bar.addStretch(1)
 
+        # ---- 筛选：直播间、时间范围（两页共用）
         self.room_combo = QComboBox()
         self.room_combo.setMinimumWidth(220)
         self.room_combo.currentIndexChanged.connect(lambda _index: self.refresh())
+        self.range_combo = QComboBox()
+        for label, key in RANGES:
+            self.range_combo.addItem(label, key)
+        self.range_combo.currentIndexChanged.connect(self._on_range_changed)
+        today = QDate.currentDate()
+        self.from_edit = QDateEdit(today.addDays(-6))
+        self.to_edit = QDateEdit(today)
+        for edit in (self.from_edit, self.to_edit):
+            edit.setCalendarPopup(True)
+            edit.setDisplayFormat("yyyy-MM-dd")
+            edit.dateChanged.connect(lambda _date: self.refresh())
+        self.to_label = QLabel("到")
         filter_row = QHBoxLayout()
         filter_row.addWidget(QLabel("直播间："))
         filter_row.addWidget(self.room_combo)
         filter_row.addSpacing(12)
-        filter_row.addWidget(hint_label("每次从开始发弹幕到停止发弹幕记一条，发送不到 5 分钟的不保存"), 1)
+        filter_row.addWidget(QLabel("时间："))
+        filter_row.addWidget(self.range_combo)
+        filter_row.addWidget(self.from_edit)
+        filter_row.addWidget(self.to_label)
+        filter_row.addWidget(self.to_edit)
+        filter_row.addSpacing(12)
+        filter_row.addWidget(hint_label("每次从开始发弹幕到停止发弹幕记一条，发送不到 5 分钟的不保存；按开始时间筛选"), 1)
+        self._on_range_changed(redraw=False)
 
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_records_tab(), "记录")
+        self.tabs.addTab(self._build_stats_tab(), "统计")
+        self.tabs.currentChanged.connect(lambda _index: self.refresh())
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(16, 14, 16, 14)
+        layout.setSpacing(10)
+        layout.addLayout(bar)
+        layout.addLayout(filter_row)
+        layout.addWidget(self.tabs, 1)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(REFRESH_MS)
+        self._timer.timeout.connect(self.refresh)
+
+    def _build_records_tab(self) -> QWidget:
         self.sessions = _table(self.SESSION_COLUMNS, multi=True)
         header = self.sessions.horizontalHeader()
         for column in range(len(self.SESSION_COLUMNS)):
@@ -137,17 +191,49 @@ class HistoryPage(QWidget):
         splitter.addWidget(self.sessions)
         splitter.addWidget(detail)
         splitter.setSizes([320, 300])
+        return splitter
 
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 14, 16, 14)
-        layout.setSpacing(10)
-        layout.addLayout(bar)
-        layout.addLayout(filter_row)
-        layout.addWidget(splitter, 1)
+    def _build_stats_tab(self) -> QWidget:
+        self.stats_summary = QLabel()
+        self.stats_summary.setWordWrap(True)
+        self.stats_summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.room_stats = _stat_table("主播")
+        self.day_stats = _stat_table("日期")
+        self.reason_stats = _table(["失败原因", "条数", "占失败的比例"])
+        header = self.reason_stats.horizontalHeader()
+        for column in range(3):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
 
-        self._timer = QTimer(self)
-        self._timer.setInterval(REFRESH_MS)
-        self._timer.timeout.connect(self.refresh)
+        def titled(text: str, table: QTableWidget) -> QWidget:
+            box = QWidget()
+            box_layout = QVBoxLayout(box)
+            box_layout.setContentsMargins(0, 0, 0, 0)
+            box_layout.setSpacing(4)
+            label = QLabel(text)
+            label.setStyleSheet("font-weight: bold;")
+            box_layout.addWidget(label)
+            box_layout.addWidget(table, 1)
+            return box
+
+        top = QSplitter(Qt.Orientation.Horizontal)
+        top.setChildrenCollapsible(False)
+        top.addWidget(titled("按直播间", self.room_stats))
+        top.addWidget(titled("失败原因", self.reason_stats))
+        top.setSizes([620, 380])
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter.setChildrenCollapsible(False)
+        splitter.addWidget(top)
+        splitter.addWidget(titled("按天（按开始那天算）", self.day_stats))
+        splitter.setSizes([300, 320])
+
+        page = QWidget()
+        page_layout = QVBoxLayout(page)
+        page_layout.setContentsMargins(0, 8, 0, 0)
+        page_layout.setSpacing(8)
+        page_layout.addWidget(self.stats_summary)
+        page_layout.addWidget(splitter, 1)
+        return page
 
     # ------------------------------------------------------------ 刷新
 
@@ -164,13 +250,43 @@ class HistoryPage(QWidget):
         if self.isVisible():
             self.refresh()
 
+    def _on_range_changed(self, _index: int = 0, redraw: bool = True) -> None:
+        custom = self.range_combo.currentData() == "custom"
+        for widget in (self.from_edit, self.to_label, self.to_edit):
+            widget.setVisible(custom)
+        if redraw:
+            self.refresh()
+
+    def time_range(self) -> tuple[float | None, float | None]:
+        """（开始, 结束）的时间戳，按记录的开始时间筛选；None 表示不限。"""
+        key = self.range_combo.currentData()
+        today = date.today()
+        if key == "custom":
+            first, last = self.from_edit.date().toPython(), self.to_edit.date().toPython()
+            if last < first:
+                first, last = last, first
+            return _day_start(first), _day_start(last + timedelta(days=1))
+        start = {
+            "today": today,
+            "7": today - timedelta(days=6),
+            "30": today - timedelta(days=29),
+            "month": today.replace(day=1),
+        }.get(key)
+        return (_day_start(start) if start else None), None
+
     def refresh(self) -> None:
         self._reload_rooms()
-        selected = set(self._selected_ids())
         room_id = self.room_combo.currentData()
-        self._records = self.store.sessions(room_id)
-        now = time.time()
+        start, end = self.time_range()
+        self._records = self.store.sessions(room_id, start, end)
+        if self.tabs.currentIndex() == 0:
+            self._fill_records()
+        else:
+            self._fill_stats(room_id, start, end)
 
+    def _fill_records(self) -> None:
+        selected = set(self._selected_ids())
+        now = time.time()
         table = self.sessions
         table.blockSignals(True)
         table.setRowCount(len(self._records))
@@ -203,6 +319,46 @@ class HistoryPage(QWidget):
         table.blockSignals(False)
         self._show_detail()
 
+    def _fill_stats(self, room_id: int | None, start: float | None, end: float | None) -> None:
+        now = time.time()
+        total = total_stats(self._records, now)
+        if not self._records:
+            self.stats_summary.setText("这个范围里没有记录。")
+        else:
+            rate = "" if total.success_rate is None else f"，成功率 <b>{total.success_rate:.1%}</b>"
+            self.stats_summary.setText(
+                f"共 <b>{total.sessions}</b> 场，总时长 <b>{format_duration(total.seconds)}</b>；"
+                f"发送 <b>{total.sent:,}</b> 条，成功 <b>{total.ok:,}</b> 条，失败 <b>{total.failed:,}</b> 条{rate}"
+                f"<br><span style='color:{self.colors.muted}'>只统计保存下来的记录（发送 5 分钟以上的），还在进行的记录算到现在</span>"
+            )
+        self._fill_stat_table(self.room_stats, stats_by_room(self._records, now), tips=True)
+        self._fill_stat_table(self.day_stats, stats_by_day(self._records, now))
+
+        reasons = self.store.failure_breakdown(room_id, start, end)
+        failed = sum(count for _, count in reasons)
+        self.reason_stats.setRowCount(len(reasons))
+        for row, (category, count) in enumerate(reasons):
+            self.reason_stats.setItem(row, 0, _item(category))
+            self.reason_stats.setItem(row, 1, _item(f"{count:,}", align_right=True))
+            self.reason_stats.setItem(row, 2, _item(f"{count / failed:.1%}", align_right=True))
+
+    def _fill_stat_table(self, table: QTableWidget, rows: list[StatRow], tips: bool = False) -> None:
+        table.setRowCount(len(rows))
+        for index, row in enumerate(rows):
+            cells = [
+                _item(row.label, tip=f"房间号 {row.key}" if tips else ""),
+                _item(str(row.sessions), align_right=True),
+                _item(format_duration(row.seconds), align_right=True),
+                _item(f"{row.sent:,}", align_right=True),
+                _item(f"{row.ok:,}", align_right=True),
+                _item(f"{row.failed:,}", align_right=True),
+                _item(_rate_text(row), align_right=True),
+            ]
+            if row.failed:
+                cells[5].setForeground(QColor(self.colors.error))
+            for column, cell in enumerate(cells):
+                table.setItem(index, column, cell)
+
     def _reload_rooms(self) -> None:
         current = self.room_combo.currentData()
         rooms = self.store.rooms()
@@ -230,7 +386,7 @@ class HistoryPage(QWidget):
         self.delete_btn.setEnabled(any(not r.ongoing for r in self._records if r.id in ids))
         self.failures.setRowCount(0)
         if not self._records:
-            self.summary.setText("还没有记录。发送超过 5 分钟后，停止发送时会在这里记一条。")
+            self.summary.setText("这个范围里没有记录。发送超过 5 分钟后，停止发送时会在这里记一条。")
             return
         if len(ids) != 1:
             self.summary.setText("选中一条记录，这里会列出那次所有失败的弹幕。" if not ids else f"选中了 {len(ids)} 条记录。")
@@ -242,8 +398,10 @@ class HistoryPage(QWidget):
         reasons = Counter(f.category for f in failures)
         reason_text = "，".join(f"{category} {n} 条" for category, n in reasons.most_common())
         end = "还在发送" if record.ongoing else f"{_time_text(record.ended_at, '%Y-%m-%d %H:%M:%S')}（{record.end_reason}）"
+        # 这里用了 HTML（加粗、换行），主播昵称和失败原因要转义，不能当成 HTML
+        end, reason_text = html.escape(end), html.escape(reason_text)
         self.summary.setText(
-            f"<b>{record.uname}</b>（房间 {record.room_id}）　"
+            f"<b>{html.escape(record.uname)}</b>（房间 {record.room_id}）　"
             f"{_time_text(record.started_at, '%Y-%m-%d %H:%M:%S')} 开始，{end}，共 {format_duration(record.duration())}<br>"
             f"发送 {record.sent} 条，成功 {record.ok} 条，失败 {record.failed} 条"
             + (f"：{reason_text}" if reason_text else "")

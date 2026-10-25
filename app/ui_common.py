@@ -2,12 +2,26 @@
 
 from __future__ import annotations
 
+import html
+import math
 import time
 from collections.abc import Callable
 
 import qrcode
-from PySide6.QtCore import QObject, QRectF, QRunnable, Qt, QThreadPool, Signal
-from PySide6.QtGui import QColor, QFont, QGuiApplication, QIcon, QImage, QPainter, QPainterPath, QPixmap
+from PySide6.QtCore import QObject, QPointF, QRectF, QRunnable, Qt, QThreadPool, Signal
+from PySide6.QtGui import (
+    QColor,
+    QFont,
+    QGuiApplication,
+    QIcon,
+    QImage,
+    QPainter,
+    QPainterPath,
+    QPalette,
+    QPen,
+    QPixmap,
+    QPolygonF,
+)
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
@@ -17,6 +31,7 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QStyle,
     QStyledItemDelegate,
+    QWidget,
 )
 from shiboken6 import isValid
 
@@ -56,17 +71,43 @@ def circle_avatar(source: QPixmap | None, size: int) -> QPixmap:
 # ---------------------------------------------------------------- 常用控件
 
 
+def format_duration(seconds: float) -> str:
+    """时长写成“1 小时 5 分”“12 分 30 秒”“45 秒”。"""
+    seconds = int(seconds)
+    hours, rest = divmod(seconds, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours} 小时 {minutes} 分"
+    if minutes:
+        return f"{minutes} 分 {secs} 秒"
+    return f"{secs} 秒"
+
+
 def hint_label(text: str = "") -> QLabel:
-    """灰色的小字说明。"""
+    """灰色的小字说明。只显示纯文字（见 plain_tip）。"""
     label = QLabel(text)
+    label.setTextFormat(Qt.TextFormat.PlainText)
     label.setWordWrap(True)
     label.setStyleSheet(f"color: {StatusColors().muted};")
     return label
 
 
 def set_colored(label: QLabel, text: str, color: str = "") -> None:
+    """显示一句状态（常带着主播昵称、直播标题、B 站返回的提示），按纯文字显示。"""
+    label.setTextFormat(Qt.TextFormat.PlainText)
     label.setText(text)
     label.setStyleSheet(f"color: {color};" if color else "")
+
+
+def plain_tip(text: str) -> str:
+    """鼠标提示按纯文字显示。凡是可能带着 B 站来的文字（直播标题、主播昵称、表情名字等）的提示都要过一下这里。
+
+    Qt 看到像 HTML 的提示文字会当网页显示，里面的 <img> 还会去读本机文件、甚至连别人电脑上的共享文件夹
+    （Windows 会顺带发出登录验证信息）。主播改个直播标题就能做到，所以转义成普通文字，换行照旧。
+    """
+    if not text:
+        return ""
+    return "<qt>" + html.escape(text, quote=False).replace("\n", "<br>") + "</qt>"
 
 
 def unit_row(spin: QSpinBox, unit: str = "秒") -> QHBoxLayout:
@@ -181,6 +222,109 @@ def make_app_icon(paused: bool = False) -> QIcon:
     return icon
 
 
+def help_icon(tip: str) -> QLabel:
+    """圆圈里一个问号，鼠标停在上面显示说明。不常看的解释文字放这里，界面不占地方。"""
+    size, ratio = 16, 2
+    pixmap = QPixmap(size * ratio, size * ratio)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+    color = QColor(StatusColors().muted)
+    pen = QPen(color)
+    pen.setWidthF(1.3 * ratio)
+    painter.setPen(pen)
+    full = QRectF(0, 0, size * ratio, size * ratio)
+    painter.drawEllipse(full.adjusted(ratio, ratio, -ratio, -ratio))
+    font = QFont("Microsoft YaHei UI")
+    font.setBold(True)
+    font.setPixelSize(10 * ratio)
+    painter.setFont(font)
+    painter.drawText(full, Qt.AlignmentFlag.AlignCenter, "?")
+    painter.end()
+    pixmap.setDevicePixelRatio(ratio)
+    label = QLabel()
+    label.setPixmap(pixmap)
+    label.setFixedSize(size, size)
+    label.setToolTip(tip)
+    label.setCursor(Qt.CursorShape.WhatsThisCursor)
+    return label
+
+
+def with_help(widget: QWidget, tip: str) -> QHBoxLayout:
+    """控件后面跟一个问号（问号上显示说明）。"""
+    row = QHBoxLayout()
+    row.setSpacing(6)
+    row.addWidget(widget)
+    row.addWidget(help_icon(tip), 0, Qt.AlignmentFlag.AlignTop if isinstance(widget, QLabel) else Qt.AlignmentFlag.AlignVCenter)
+    row.addStretch(1)
+    return row
+
+
+# ---------------------------------------------------------------- 左侧功能栏的图标
+
+
+def _draw_rooms(painter: QPainter, color: QColor) -> None:
+    """直播间：一台电视，屏幕里一个播放三角。"""
+    painter.drawRoundedRect(QRectF(3, 4.5, 18, 13), 2.5, 2.5)
+    painter.drawLine(QPointF(8, 20.5), QPointF(16, 20.5))
+    painter.setBrush(color)
+    painter.drawPolygon(QPolygonF([QPointF(10.2, 8.2), QPointF(10.2, 13.8), QPointF(15, 11)]))
+
+
+def _draw_favorites(painter: QPainter, color: QColor) -> None:
+    """弹幕收藏夹：一颗五角星。"""
+    points = []
+    for k in range(10):
+        angle = math.radians(-90 + k * 36)
+        radius = 9.5 if k % 2 == 0 else 4.2
+        points.append(QPointF(12 + radius * math.cos(angle), 12.8 + radius * math.sin(angle)))
+    painter.drawPolygon(QPolygonF(points))
+
+
+def _draw_history(painter: QPainter, color: QColor) -> None:
+    """历史记录：一个钟。"""
+    painter.drawEllipse(QPointF(12, 12), 8.8, 8.8)
+    painter.drawLine(QPointF(12, 12), QPointF(12, 7))
+    painter.drawLine(QPointF(12, 12), QPointF(15.5, 14.2))
+
+
+def _draw_settings(painter: QPainter, color: QColor) -> None:
+    """设置：一个齿轮（8 个齿）和中间的圆孔。"""
+    points = []
+    for k in range(32):
+        angle = math.radians(k * 360 / 32 - 360 / 64 * 3)
+        radius = 9.5 if k % 4 in (1, 2) else 7.2
+        points.append(QPointF(12 + radius * math.cos(angle), 12 + radius * math.sin(angle)))
+    painter.drawPolygon(QPolygonF(points))
+    painter.drawEllipse(QPointF(12, 12), 3, 3)
+
+
+_NAV_DRAWERS = {"rooms": _draw_rooms, "favorites": _draw_favorites, "history": _draw_history, "settings": _draw_settings}
+
+
+def nav_icon(kind: str) -> QIcon:
+    """左侧功能栏的线条图标（自己画，不用 Emoji 和图片文件），颜色跟着深色 / 浅色模式的文字颜色。"""
+    color = QGuiApplication.palette().color(QPalette.ColorRole.WindowText)
+    icon = QIcon()
+    for size in (16, 18, 20, 24, 32, 36, 40, 48):
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.scale(size / 24, size / 24)  # 按 24×24 的格子画
+        pen = QPen(color)
+        pen.setWidthF(1.7)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        _NAV_DRAWERS[kind](painter, color)
+        painter.end()
+        icon.addPixmap(pixmap)
+    return icon
+
+
 def qr_pixmap(text: str, size: int = 220) -> QPixmap:
     qr = qrcode.QRCode(border=2, error_correction=qrcode.constants.ERROR_CORRECT_M)
     qr.add_data(text)
@@ -249,8 +393,18 @@ class _Task(QRunnable):
 _running: set[_Task] = set()
 
 
-def run_async(owner: QObject, fn: Callable, *args, on_done: Callable | None = None, on_error: Callable | None = None) -> None:
-    """在后台线程执行 fn(*args)，完成后在界面线程回调。owner 已被销毁（比如窗口关了）就不回调。"""
+def run_async(
+    owner: QObject,
+    fn: Callable,
+    *args,
+    on_done: Callable | None = None,
+    on_error: Callable | None = None,
+    pool: QThreadPool | None = None,
+) -> None:
+    """在后台线程执行 fn(*args)，完成后在界面线程回调。owner 已被销毁（比如窗口关了）就不回调。
+
+    pool 不给就用全局线程池；一下子要排很多任务的（比如下载一大堆表情图片）用自己的线程池，免得别的任务排在后面等。
+    """
     task = _Task(fn, args)
     _running.add(task)
 
@@ -261,4 +415,4 @@ def run_async(owner: QObject, fn: Callable, *args, on_done: Callable | None = No
 
     task.signals.done.connect(lambda result: finish(on_done, result))
     task.signals.failed.connect(lambda message: finish(on_error, message))
-    QThreadPool.globalInstance().start(task)
+    (pool or QThreadPool.globalInstance()).start(task)

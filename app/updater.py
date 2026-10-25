@@ -173,7 +173,7 @@ def install_main(args: list[str], source: Path | None = None) -> int:
             pass
 
     log(f"开始从 {old_version} 更新到 {APP_VERSION}")
-    if not _wait_for_exit(wait_pid, timeout_ms=60_000):
+    if not wait_for_exit(wait_pid, timeout_ms=60_000):
         log("旧程序一分钟内没有退出，放弃更新")
         _message("旧程序没有退出，这次没有更新。请退出程序后重新选择压缩包更新。")
         return 1
@@ -231,7 +231,7 @@ def _retry(action, attempts: int = 20) -> None:
             time.sleep(0.5)
 
 
-def _wait_for_exit(pid: int, timeout_ms: int) -> bool:
+def wait_for_exit(pid: int, timeout_ms: int) -> bool:
     kernel32 = ctypes.windll.kernel32
     kernel32.OpenProcess.restype = wintypes.HANDLE
     handle = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE

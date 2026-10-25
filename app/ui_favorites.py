@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
 
 from .favorites import Favorite, FavoritesStore, FavoriteSummary, count_chars
 from .story import read_text_file
-from .ui_common import NoFocusDelegate, exact_chars, format_chars, hint_label, save_cancel_buttons
+from .ui_common import NoFocusDelegate, exact_chars, format_chars, hint_label, plain_tip, save_cancel_buttons
 from .ui_tags import TagEditor
 
 # 预览区只显示开头这么多字，整本小说塞进预览框会很慢，也没必要
@@ -142,7 +142,7 @@ class FavoritesBrowser(QWidget):
             values = [item.title, "、".join(item.tags), format_chars(item.chars), item.preview]
             for column, value in enumerate(values):
                 cell = QTableWidgetItem(value)
-                cell.setToolTip(value if column != 3 else "")
+                cell.setToolTip(plain_tip(value) if column != 3 else "")
                 self.table.setItem(row, column, cell)
         self.count_label.setText(f"共 {len(self._rows)} 条")
         for row, item in enumerate(self._rows):

@@ -18,6 +18,7 @@ import os
 import sqlite3
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -43,7 +44,7 @@ class SessionRecord:
     room_id: int
     uname: str
     mode: str
-    content: str  # 独轮车：弹幕内容；说书：书名
+    content: str  # 独轮车：弹幕内容（和选的表情）；说书：书名
     started_at: float
     last_at: float  # 最后一次发送的时间
     ended_at: float | None  # None 表示还在发送
@@ -196,15 +197,26 @@ class HistoryStore:
 
     # ------------------------------------------------------------ 查看（界面调用）
 
-    def sessions(self, room_id: int | None = None) -> list[SessionRecord]:
+    def sessions(self, room_id: int | None = None, start: float | None = None, end: float | None = None) -> list[SessionRecord]:
+        """记录列表，新的在前。start / end 按开始时间筛选（包含 start，不包含 end）。"""
+        where, args = _filters(room_id, start, end)
         sql = "SELECT id, room_id, uname, mode, content, started_at, last_at, ended_at, end_reason, sent, ok FROM sessions"
-        args: tuple = ()
-        if room_id is not None:
-            sql += " WHERE room_id = ?"
-            args = (room_id,)
-        sql += " ORDER BY started_at DESC"
         with self._lock:
-            return [SessionRecord(*row) for row in self._db.execute(sql, args)]
+            return [SessionRecord(*row) for row in self._db.execute(f"{sql}{where} ORDER BY started_at DESC", args)]
+
+    def failure_breakdown(self, room_id: int | None = None, start: float | None = None, end: float | None = None) -> list[tuple[str, int]]:
+        """这些记录里的失败按类别（系统屏蔽、主播屏蔽、被限流……）分别有多少条，多的在前。"""
+        where, args = _filters(room_id, start, end, table="s.")
+        with self._lock:
+            rows = self._db.execute(
+                f"SELECT f.outcome, f.message, COUNT(*) FROM failures f JOIN sessions s ON s.id = f.session_id{where}"
+                " GROUP BY f.outcome, f.message",
+                args,
+            ).fetchall()
+        counts: Counter[str] = Counter()
+        for outcome, message, count in rows:
+            counts[FailureRecord(0, outcome, message, "").category] += count
+        return sorted(counts.items(), key=lambda item: (-item[1], item[0]))  # 一样多的按名字排，每次显示的顺序不变
 
     def rooms(self) -> list[tuple[int, str]]:
         """有记录的直播间：（房间号, 最近一次记录里的主播名）。"""
@@ -241,6 +253,15 @@ class HistoryStore:
 
     # ------------------------------------------------------------ 屏蔽词整理表
 
+    def is_filtered(self, text: str, room_id: int) -> bool:
+        """这段文字以前被屏蔽过没有：在这个直播间被屏蔽过（系统屏蔽或主播屏蔽都算），
+        或者在任何直播间被系统屏蔽（f）过。说书时“跳过以前被屏蔽过的段落”用。"""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT 1 FROM filtered WHERE text = ? AND (room_id = ? OR message = 'f') LIMIT 1", (text, room_id)
+            ).fetchone()
+        return row is not None
+
     def filtered_count(self) -> int:
         with self._lock:
             return self._db.execute("SELECT COUNT(*) FROM filtered").fetchone()[0]
@@ -261,6 +282,72 @@ class HistoryStore:
                 writer.writerow([_csv_text(text), uname, room_id, count, kind, _stamp(first_at), _stamp(last_at)])
         os.replace(temp, path)
         return path
+
+
+def _filters(room_id: int | None, start: float | None, end: float | None, table: str = "") -> tuple[str, tuple]:
+    """按直播间和开始时间筛选的 WHERE 子句。"""
+    conditions, args = [], []
+    for sql, value in ((f"{table}room_id = ?", room_id), (f"{table}started_at >= ?", start), (f"{table}started_at < ?", end)):
+        if value is not None:
+            conditions.append(sql)
+            args.append(value)
+    return (" WHERE " + " AND ".join(conditions) if conditions else ""), tuple(args)
+
+
+# ---------------------------------------------------------------- 统计
+
+
+@dataclass
+class StatRow:
+    """一组记录的合计：一个直播间、一天，或者全部。"""
+
+    key: object
+    label: str
+    sessions: int = 0
+    seconds: float = 0.0
+    sent: int = 0
+    ok: int = 0
+
+    @property
+    def failed(self) -> int:
+        return self.sent - self.ok
+
+    @property
+    def success_rate(self) -> float | None:
+        return self.ok / self.sent if self.sent else None
+
+    def add(self, record: SessionRecord, now: float | None) -> None:
+        """加上一条记录。还在进行的记录，时长算到 now（不给就是现在）。"""
+        self.sessions += 1
+        self.seconds += record.duration(now)
+        self.sent += record.sent
+        self.ok += record.ok
+
+
+def total_stats(records: list[SessionRecord], now: float | None = None) -> StatRow:
+    row = StatRow(None, "合计")
+    for record in records:
+        row.add(record, now)
+    return row
+
+
+def stats_by_room(records: list[SessionRecord], now: float | None = None) -> list[StatRow]:
+    """按直播间合计，发得多的在前。主播名用最近一条记录里的。"""
+    rows: dict[int, StatRow] = {}
+    for record in sorted(records, key=lambda r: r.started_at, reverse=True):
+        if record.room_id not in rows:
+            rows[record.room_id] = StatRow(record.room_id, record.uname or f"房间 {record.room_id}")
+        rows[record.room_id].add(record, now)
+    return sorted(rows.values(), key=lambda row: (-row.sent, -row.seconds))
+
+
+def stats_by_day(records: list[SessionRecord], now: float | None = None) -> list[StatRow]:
+    """按开始那天（本地时间）合计，新的日子在前。跨过半夜的一场算在开始那天。"""
+    rows: dict[str, StatRow] = {}
+    for record in records:
+        day = time.strftime("%Y-%m-%d", time.localtime(record.started_at))
+        rows.setdefault(day, StatRow(day, day)).add(record, now)
+    return [rows[day] for day in sorted(rows, reverse=True)]
 
 
 def _stamp(timestamp: float) -> str:

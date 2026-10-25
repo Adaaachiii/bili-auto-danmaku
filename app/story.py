@@ -67,6 +67,15 @@ class StoryText:
         return "".join(parts), pos
 
 
+def count_chunks(text: StoryText, size: int, by_line: bool, start: int = 0) -> int:
+    """从 start 说到结尾一共要发多少条。一百万字约 2.8 万条，十几毫秒就数完。"""
+    pos, count = start, 0
+    while pos < text.length:
+        _, pos = text.next_chunk(pos, size, by_line)
+        count += 1
+    return count
+
+
 def text_fingerprint(raw: str) -> tuple[str, int]:
     """返回（指纹, 有效字数），保存文字时记进配置。"""
     story = StoryText(raw)

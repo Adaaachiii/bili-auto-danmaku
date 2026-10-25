@@ -26,6 +26,18 @@ def _launch_command() -> str:
     return f'"{exe}" "{PROJECT_DIR / "main.py"}" --minimized'
 
 
+def relaunch(extra_args: list[str]) -> None:
+    """另外启动一个本程序（恢复备份后重新打开用）。不带命令行窗口，和当前程序互不影响。"""
+    if getattr(sys, "frozen", False):
+        command = [sys.executable, *extra_args]
+    else:
+        exe = Path(sys.executable)
+        pythonw = exe.with_name("pythonw.exe")
+        command = [str(pythonw if pythonw.exists() else exe), str(PROJECT_DIR / "main.py"), *extra_args]
+    flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    subprocess.Popen(command, cwd=str(Path(command[0]).parent), creationflags=flags, close_fds=True)
+
+
 def is_autostart_enabled() -> bool:
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as key:

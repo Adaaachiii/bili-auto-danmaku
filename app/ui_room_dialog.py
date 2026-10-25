@@ -1,8 +1,11 @@
-"""添加 / 编辑直播间：直播间、发送模式（独轮车 / 说书人）、发送间隔、其他选项。"""
+"""添加 / 编辑直播间：直播间、模式（独轮车 / 说书人 / 只提醒）、发送间隔、发送限制、其他选项。"""
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt
+from collections.abc import Callable
+
+from PySide6.QtCore import QRect, Qt, QTime, QTimer
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QButtonGroup,
     QCheckBox,
@@ -10,41 +13,78 @@ from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QFrame,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
-    QLayout,
     QLineEdit,
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
     QRadioButton,
+    QScrollArea,
     QSpinBox,
+    QTimeEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from . import bili_api, story
+from .bili_api import Credentials
 from .config import (
     DANMAKU_MAX_LENGTH,
     DEFAULT_SEND_INTERVAL,
+    DEFAULT_WINDOW,
+    MAX_LIMIT_COUNT,
+    MAX_LIMIT_MINUTES,
     MAX_SEND_INTERVAL,
     MIN_SEND_INTERVAL,
+    MODE_NOTIFY,
     MODE_REPEAT,
     MODE_STORY,
     RoomConfig,
+    parse_hhmm,
 )
 from .favorites import FavoritesStore, count_chars
+from .story import StoryText, count_chunks
 from .ui_common import (
     MessageEdit,
     StatusColors,
     exact_chars,
+    format_duration,
+    help_icon,
     hint_label,
     run_async,
     save_cancel_buttons,
     set_colored,
     unit_row,
+    with_help,
 )
+
+DEFAULT_LIMIT_COUNT = 200  # 勾上“每场最多发多少条”时的默认值
+DEFAULT_LIMIT_MINUTES = 60
+# 系统屏蔽在任何直播间被拦过都算，主播屏蔽只算这个直播间（见 history.HistoryStore.is_filtered）
+SKIP_FILTERED_TIP = "若某一段落曾被系统屏蔽，或曾在直播间被主播屏蔽，在发送弹幕时自动跳过。"
+REPEAT_ORDER_TIP = (
+    "文字和表情按“文字→表情1→表情2→……”的顺序轮流发，拖动表情可以调整顺序；不填文字就只发表情。\n"
+    "勾上“随机顺序”就每次随机挑一条，但不会连着发同一条。"
+)
+
+
+def _time_edit() -> QTimeEdit:
+    edit = QTimeEdit()
+    edit.setDisplayFormat("HH:mm")
+    edit.setFixedWidth(100)
+    return edit
+
+
+def _qtime(text: str, fallback: str) -> QTime:
+    minutes = parse_hhmm(text)
+    if minutes is None:
+        minutes = parse_hhmm(fallback)
+    return QTime(minutes // 60, minutes % 60)
+from .ui_emoticons import EmoticonPickerDialog, EmoticonStrip
 from .ui_favorites import FavoritePickerDialog, import_txt
 from .ui_tags import TagEditor
 
@@ -76,6 +116,7 @@ class RoomDialog(QDialog):
         taken_ids: set[int],
         store: FavoritesStore,
         progress: tuple[int, int] | None = None,  # 说书进度（已说到第几个字, 总字数）
+        creds: Callable[[], Credentials | None] | None = None,  # 取现在登录的账号，选表情时用
     ):
         super().__init__(parent)
         self.setWindowTitle("编辑直播间" if room else "添加直播间")
@@ -92,15 +133,32 @@ class RoomDialog(QDialog):
         self._story_hash = room.story_hash if room else ""
         self._story_chars = room.story_chars if room else 0
         self._progress = progress
+        self._creds = creds
+        self._story_cache: StoryText | None = None  # 算“预计多久说完”用，文字没换就不重新整理
+
+        # 各项设置放在可以滚动的区域里，保存 / 取消按钮固定在最下面。
+        # 窗口高度跟着内容走（切换模式时自动变高变矮），但不超过屏幕，放不下时出现滚动条。
+        self.content = QWidget()
+        content_layout = QVBoxLayout(self.content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(10)
+        content_layout.addWidget(self._build_room_group())
+        content_layout.addWidget(self._build_mode_group())
+        self.interval_group = self._build_interval_group()
+        content_layout.addWidget(self.interval_group)
+        self.limit_group = self._build_limit_group()
+        content_layout.addWidget(self.limit_group)
+        content_layout.addWidget(self._build_other_group())
+        content_layout.addStretch(1)
+        self.scroll = QScrollArea()
+        self.scroll.setWidget(self.content)
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
-        # 窗口大小始终跟着内容走：切换模式时自动变高变矮，不会留空白或残影
-        layout.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
-        layout.addWidget(self._build_room_group())
-        layout.addWidget(self._build_mode_group())
-        layout.addWidget(self._build_interval_group())
-        layout.addWidget(self._build_other_group())
+        layout.addWidget(self.scroll, 1)
         self.buttons = save_cancel_buttons(self)
         self.buttons.button(QDialogButtonBox.StandardButton.Save).setAutoDefault(False)  # 输入框里按回车不要直接保存
         layout.addWidget(self.buttons)
@@ -110,6 +168,40 @@ class RoomDialog(QDialog):
         self._update_save_button()
         if room:
             self._query()  # 顺便显示一下当前状态
+
+    # ------------------------------------------------------------ 窗口大小
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._fit_to_content()
+
+    def _schedule_fit(self) -> None:
+        """内容变了（切换模式、查询结果多了一行等）：等布局算好后重新定窗口大小。"""
+        if self.isVisible():
+            QTimer.singleShot(0, self._fit_to_content)
+
+    def _fit_to_content(self, screen: QRect | None = None) -> None:
+        """窗口高度＝内容的高度，但不超过屏幕可用高度；超出的部分用滚动条看。宽度刚好放下内容。
+
+        screen 是屏幕上能用的区域（不含任务栏），默认是窗口所在的屏幕；测试时可以传一个小的进来。
+        """
+        self.content.adjustSize()
+        hint = self.content.sizeHint()
+        margins = self.layout().contentsMargins()
+        chrome_h = margins.top() + margins.bottom() + self.layout().spacing() + self.buttons.sizeHint().height()
+        chrome_w = margins.left() + margins.right()
+        screen = screen or (self.screen() or QGuiApplication.primaryScreen()).availableGeometry()
+        title_bar = max(0, self.frameGeometry().height() - self.height()) or 32
+        max_h = screen.height() - title_bar - 16
+        need_h = hint.height() + chrome_h
+        bar = self.scroll.verticalScrollBar().sizeHint().width() if need_h > max_h else 0
+        width = min(hint.width() + chrome_w + bar, screen.width() - 16)
+        self.scroll.setMinimumWidth(width - chrome_w)
+        self.resize(width, min(need_h, max_h))
+        # 变高以后底部跑到屏幕外面的话，往上挪
+        frame = self.frameGeometry()
+        if frame.bottom() > screen.bottom() or frame.top() < screen.top():
+            self.move(frame.left(), max(screen.top(), screen.bottom() - frame.height()))
 
     # ------------------------------------------------------------ 搭界面
 
@@ -137,21 +229,21 @@ class RoomDialog(QDialog):
     def _build_mode_group(self) -> QGroupBox:
         self.repeat_radio = QRadioButton("独轮车模式")
         self.story_radio = QRadioButton("说书人模式")
+        self.notify_radio = QRadioButton("只提醒（不发弹幕）")
         self.mode_group = QButtonGroup(self)
-        self.mode_group.addButton(self.repeat_radio)
-        self.mode_group.addButton(self.story_radio)
         mode_row = QHBoxLayout()
-        mode_row.addWidget(self.repeat_radio)
-        mode_row.addSpacing(16)
-        mode_row.addWidget(self.story_radio)
+        for radio in (self.repeat_radio, self.story_radio, self.notify_radio):
+            self.mode_group.addButton(radio)
+            mode_row.addWidget(radio)
+            mode_row.addSpacing(16)
         mode_row.addStretch(1)
         self.mode_hint = hint_label()
 
         self.repeat_page = self._build_repeat_page()
         self.story_page = self._build_story_page()
-        self.repeat_radio.toggled.connect(self._on_mode_changed)
+        self.mode_group.buttonToggled.connect(lambda _button, checked: checked and self._on_mode_changed())
 
-        group = QGroupBox("发送模式")
+        group = QGroupBox("模式")
         box = QVBoxLayout(group)
         box.addLayout(mode_row)
         box.addWidget(self.mode_hint)
@@ -161,7 +253,7 @@ class RoomDialog(QDialog):
 
     def _build_repeat_page(self) -> QWidget:
         self.msg_edit = MessageEdit(DANMAKU_MAX_LENGTH)
-        self.msg_edit.setPlaceholderText("要循环发送的那句话")
+        self.msg_edit.setPlaceholderText("要循环发送的那句话（只发表情的话可以不填）")
         self.msg_count = hint_label()
         pick_btn = QPushButton("从收藏夹选择")
         pick_btn.setAutoDefault(False)
@@ -177,11 +269,37 @@ class RoomDialog(QDialog):
         form.setVerticalSpacing(4)
         form.addRow("弹幕内容：", self.msg_edit)
         form.addRow("", pick_row)
+        form.addRow("表情：", self._build_emoticon_box())
         page.setLayout(form)
         return page
 
+    def _build_emoticon_box(self) -> QVBoxLayout:
+        self.emoticon_empty = hint_label("没有选表情，只发文字")
+        self.emoticon_strip = EmoticonStrip()
+        self.emoticon_strip.setFixedHeight(84)
+        self.emoticon_strip.changed.connect(self._on_emoticons_changed)
+        self.emoticon_btn = QPushButton("选择表情…")
+        self.emoticon_clear_btn = QPushButton("清空")
+        for button in (self.emoticon_btn, self.emoticon_clear_btn):
+            button.setAutoDefault(False)
+        self.emoticon_btn.clicked.connect(self._pick_emoticons)
+        self.emoticon_clear_btn.clicked.connect(lambda: self.emoticon_strip.set_emoticons([]))
+        self.repeat_random_check = QCheckBox("随机顺序")
+        row = QHBoxLayout()
+        row.addWidget(self.emoticon_btn)
+        row.addWidget(self.emoticon_clear_btn)
+        row.addSpacing(16)
+        row.addLayout(with_help(self.repeat_random_check, REPEAT_ORDER_TIP))
+        box = QVBoxLayout()
+        box.setSpacing(4)
+        box.addWidget(self.emoticon_empty)
+        box.addWidget(self.emoticon_strip)
+        box.addLayout(row)
+        return box
+
     def _build_story_page(self) -> QWidget:
         self.story_label = QLabel()
+        self.story_label.setTextFormat(Qt.TextFormat.PlainText)  # 标题可能来自导入的文件名
         self.story_label.setWordWrap(True)
         edit_btn = QPushButton("编辑内容")
         pick_btn = QPushButton("从收藏夹选择")
@@ -223,11 +341,16 @@ class RoomDialog(QDialog):
         line_box.addLayout(line_row)
         line_box.addWidget(self.line_hint)
 
+        self.estimate_label = QLabel()
+        self.chunk_spin.valueChanged.connect(self._update_estimate)
+        self.by_line_radio.toggled.connect(self._update_estimate)
+
         self.finish_combo = QComboBox()
         self.finish_combo.addItem("停止发送", False)
         self.finish_combo.addItem("从头循环", True)
         self.finish_combo.setFixedWidth(140)
         self.inherit_check = QCheckBox("说书状态继承（本场直播结束后停止说书，下次直播开始时从中断处继续）")
+        self.skip_filtered_check = QCheckBox("跳过以前被屏蔽过的段落")
 
         page = QWidget()
         form = _form()
@@ -238,8 +361,10 @@ class RoomDialog(QDialog):
         form.addRow("", reset_row)
         form.addRow("每条字数：", unit_row(self.chunk_spin, "字"))
         form.addRow("换行处理：", line_box)
+        form.addRow("预计：", with_help(self.estimate_label, "不算被限流、被屏蔽和不在发送时段的时间"))
         form.addRow("说书结束后：", self.finish_combo)
         form.addRow("", self.inherit_check)
+        form.addRow("", with_help(self.skip_filtered_check, SKIP_FILTERED_TIP))
         page.setLayout(form)
         return page
 
@@ -267,11 +392,51 @@ class RoomDialog(QDialog):
 
         self.random_check.toggled.connect(self._update_interval_widgets)
         self.interval_spin.valueChanged.connect(self._update_interval_widgets)
+        self.max_spin.valueChanged.connect(self._update_estimate)
 
         group = QGroupBox("发送间隔")
         box = QVBoxLayout(group)
         box.addLayout(row)
         box.addWidget(self.interval_hint)
+        return group
+
+    def _build_limit_group(self) -> QGroupBox:
+        self.count_check = QCheckBox("每场最多发")
+        self.count_spin = QSpinBox()
+        self.count_spin.setRange(1, MAX_LIMIT_COUNT)
+        self.count_spin.setFixedWidth(100)
+        self.minutes_check = QCheckBox("每场最多发")
+        self.minutes_spin = QSpinBox()
+        self.minutes_spin.setRange(1, MAX_LIMIT_MINUTES)
+        self.minutes_spin.setFixedWidth(100)
+        self.window_check = QCheckBox("只在每天")
+        self.window_start_edit = _time_edit()
+        self.window_end_edit = _time_edit()
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(6)
+        rows = [
+            (self.count_check, [self.count_spin, QLabel("条（按发送成功的条数算）")]),
+            (self.minutes_check, [self.minutes_spin, QLabel("分钟（从这一场发出第一条算起）")]),
+            (self.window_check, [self.window_start_edit, QLabel("到"), self.window_end_edit, QLabel("之间发送")]),
+        ]
+        for row, (check, widgets) in enumerate(rows):
+            grid.addWidget(check, row, 0)
+            line = QHBoxLayout()
+            for widget in widgets:
+                line.addWidget(widget)
+            line.addStretch(1)
+            if row == 0:
+                line.addWidget(help_icon("可同时设置多条规则，触发某一规则上限后即停止发送。"))
+            grid.addLayout(line, row, 1)
+            check.toggled.connect(self._update_limit_widgets)
+        grid.setColumnStretch(1, 1)
+        self.window_check.setToolTip("结束时间早于开始时间表示跨过半夜，比如 22:00 到 02:00")
+
+        group = QGroupBox("发送限制")
+        box = QVBoxLayout(group)
+        box.addLayout(grid)
         return group
 
     def _build_other_group(self) -> QGroupBox:
@@ -290,19 +455,30 @@ class RoomDialog(QDialog):
             self.room_edit.setReadOnly(True)
             self.query_btn.setText("刷新")
         cfg = room or RoomConfig(room_id=0, interval_sec=DEFAULT_SEND_INTERVAL)
-        (self.story_radio if cfg.mode == MODE_STORY else self.repeat_radio).setChecked(True)
+        {MODE_STORY: self.story_radio, MODE_NOTIFY: self.notify_radio}.get(cfg.mode, self.repeat_radio).setChecked(True)
         self._on_mode_changed()
         self.msg_edit.setText(cfg.message)
         self._update_count()
+        self.emoticon_strip.set_emoticons(cfg.emoticons)
+        self.repeat_random_check.setChecked(cfg.repeat_random)
         self.chunk_spin.setValue(cfg.story_chunk_size)
         (self.by_line_radio if cfg.story_by_line else self.ignore_lines_radio).setChecked(True)
         self._update_line_hint()
         self.finish_combo.setCurrentIndex(1 if cfg.story_loop else 0)
         self.inherit_check.setChecked(cfg.story_inherit)
+        self.skip_filtered_check.setChecked(cfg.story_skip_filtered)
         self.interval_spin.setValue(cfg.interval_sec)
         self.max_spin.setValue(max(cfg.interval_max_sec, cfg.interval_sec))
         self.random_check.setChecked(cfg.interval_random)
         self._update_interval_widgets()
+        self.count_check.setChecked(cfg.limit_count > 0)
+        self.count_spin.setValue(cfg.limit_count or DEFAULT_LIMIT_COUNT)
+        self.minutes_check.setChecked(cfg.limit_minutes > 0)
+        self.minutes_spin.setValue(cfg.limit_minutes or DEFAULT_LIMIT_MINUTES)
+        self.window_check.setChecked(cfg.window_enabled)
+        self.window_start_edit.setTime(_qtime(cfg.window_start, DEFAULT_WINDOW[0]))
+        self.window_end_edit.setTime(_qtime(cfg.window_end, DEFAULT_WINDOW[1]))
+        self._update_limit_widgets()
         self.open_check.setChecked(cfg.open_browser)
         self.offline_check.setChecked(cfg.send_when_offline)
         self.enabled_check.setChecked(cfg.enabled)
@@ -316,8 +492,10 @@ class RoomDialog(QDialog):
             room_id=room_id,
             uid=uid,
             uname=uname,
-            mode=MODE_STORY if self.story_radio.isChecked() else MODE_REPEAT,
+            mode=self._mode(),
             message=self.msg_edit.text().strip(),
+            emoticons=self.emoticon_strip.emoticons(),
+            repeat_random=self.repeat_random_check.isChecked(),
             interval_sec=self.interval_spin.value(),
             interval_random=self.random_check.isChecked(),
             interval_max_sec=max(self.max_spin.value(), self.interval_spin.value()),
@@ -331,7 +509,20 @@ class RoomDialog(QDialog):
             story_by_line=self.by_line_radio.isChecked(),
             story_inherit=self.inherit_check.isChecked(),
             story_loop=bool(self.finish_combo.currentData()),
+            story_skip_filtered=self.skip_filtered_check.isChecked(),
+            limit_count=self.count_spin.value() if self.count_check.isChecked() else 0,
+            limit_minutes=self.minutes_spin.value() if self.minutes_check.isChecked() else 0,
+            window_enabled=self.window_check.isChecked(),
+            window_start=self.window_start_edit.time().toString("HH:mm"),
+            window_end=self.window_end_edit.time().toString("HH:mm"),
         )
+
+    def _mode(self) -> str:
+        if self.story_radio.isChecked():
+            return MODE_STORY
+        if self.notify_radio.isChecked():
+            return MODE_NOTIFY
+        return MODE_REPEAT
 
     # ------------------------------------------------------------ 直播间查询
 
@@ -376,6 +567,7 @@ class RoomDialog(QDialog):
             text += f"\n直播标题：{status.title}"
         set_colored(self.room_info, text, self._colors.ok)
         self._update_save_button()
+        self._schedule_fit()
 
     def _on_lookup_failed(self, seq: int, message: str) -> None:
         if seq != self._query_seq:
@@ -386,15 +578,20 @@ class RoomDialog(QDialog):
     # ------------------------------------------------------------ 模式
 
     def _on_mode_changed(self) -> None:
-        story_mode = self.story_radio.isChecked()
-        self.repeat_page.setVisible(not story_mode)
-        self.story_page.setVisible(story_mode)
-        self.mode_hint.setText(
-            "把一段长文字按顺序切成多条弹幕，一条接一条地发，直到全部说完。适合发小说或大段文字。"
-            if story_mode
-            else "按间隔一直发送同一句弹幕。"
-        )
+        mode = self._mode()
+        sends = mode != MODE_NOTIFY
+        self.repeat_page.setVisible(mode == MODE_REPEAT)
+        self.story_page.setVisible(mode == MODE_STORY)
+        self.interval_group.setVisible(sends)
+        self.limit_group.setVisible(sends)
+        self.offline_check.setVisible(sends)
+        self.mode_hint.setText({
+            MODE_REPEAT: "按间隔一直发送同一句弹幕；也可以选几个表情，和文字轮流发。",
+            MODE_STORY: "把一段长文字按顺序切成多条弹幕，一条接一条地发，直到全部说完。适合发小说或大段文字。",
+            MODE_NOTIFY: "开播、下播时弹系统通知（不受设置里“系统通知”开关的影响），开播时可以自动打开直播页，不发弹幕。",
+        }[mode])
         self._update_save_button()
+        self._schedule_fit()
 
     def _update_count(self) -> None:
         self.msg_count.setText(f"{len(self.msg_edit.text().strip())} / {DANMAKU_MAX_LENGTH} 字")
@@ -405,6 +602,27 @@ class RoomDialog(QDialog):
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.result_favorite:
             # 弹幕里不能换行，换行换成空格
             self.msg_edit.setText(" ".join(dialog.result_favorite.content.split()))
+
+    def _pick_emoticons(self) -> None:
+        if self._resolved is None:
+            QMessageBox.information(self, "选择表情", "请先输入直播间并点“查询”。有的表情只能在某个直播间用，所以要先确定是哪个直播间。")
+            return
+        creds = self._creds() if self._creds else None
+        if creds is None:
+            QMessageBox.information(self, "选择表情", "请先登录 B 站账号。B 站只告诉登录了的账号它能用哪些表情（包括买过的装扮表情）。")
+            return
+        dialog = EmoticonPickerDialog(self, self._resolved[0], creds, self.emoticon_strip.emoticons())
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.emoticon_strip.set_emoticons(dialog.result_emoticons)
+
+    def _on_emoticons_changed(self) -> None:
+        count = self.emoticon_strip.count()
+        self.emoticon_empty.setVisible(count == 0)
+        self.emoticon_strip.setVisible(count > 0)
+        self.emoticon_clear_btn.setEnabled(count > 0)
+        self.repeat_random_check.setEnabled(count > 0)  # 只有一句文字时谈不上顺序
+        self._update_save_button()
+        self._schedule_fit()
 
     # ------------------------------------------------------------ 说书内容
 
@@ -476,6 +694,46 @@ class RoomDialog(QDialog):
         else:
             self.progress_label.setText("还没开始说")
         self.reset_btn.setEnabled(unchanged and not self.reset_progress and bool(self._progress and self._progress[0]))
+        self._update_estimate()
+
+    def _story_for_estimate(self) -> StoryText | None:
+        if not self._story_hash:
+            return None
+        if self._story_cache is None or self._story_cache.hash != self._story_hash:
+            raw = self._current_story_text()
+            self._story_cache = StoryText(raw) if raw else None
+        return self._story_cache
+
+    def _resume_pos(self) -> int:
+        """保存后从哪里开始说：内容没换、没点重置、已经说了一部分，就从进度那里接着说。"""
+        unchanged = self._room is not None and self.new_story_text is None and self._story_hash == self._room.story_hash
+        if unchanged and not self.reset_progress and self._progress:
+            return self._progress[0]
+        return 0
+
+    def _update_estimate(self) -> None:
+        """说书预计：一共多少条、按现在的间隔多久说完，以及从现在的进度接着说还要多久。随机间隔按平均值算。"""
+        if not hasattr(self, "interval_spin"):
+            return  # 界面还没搭完
+        text = self._story_for_estimate()
+        if text is None or text.length == 0:
+            self.estimate_label.setText("—")
+            self._schedule_fit()
+            return
+        size, by_line = self.chunk_spin.value(), self.by_line_radio.isChecked()
+        low, high = self.interval_spin.value(), max(self.interval_spin.value(), self.max_spin.value())
+        if self.random_check.isChecked():
+            delay, every = (low + high) / 2, f"{low}～{high}"
+        else:
+            delay, every = low, f"{low}"
+        total = count_chunks(text, size, by_line)
+        lines = [f"共 {total:,} 条，每 {every} 秒一条，约 {format_duration(total * delay)}后结束"]
+        pos = self._resume_pos()
+        if 0 < pos < text.length:
+            left = count_chunks(text, size, by_line, pos)
+            lines.append(f"目前剩余 {left:,} 条，约 {format_duration(left * delay)}后结束")
+        self.estimate_label.setText("\n".join(lines))
+        self._schedule_fit()
 
     # ------------------------------------------------------------ 间隔与保存
 
@@ -488,14 +746,24 @@ class RoomDialog(QDialog):
             self.interval_hint.setText(f"弹幕发送间隔最短为{MIN_SEND_INTERVAL}秒；每条弹幕在这两个时间之间随机选一个间隔")
         else:
             self.interval_hint.setText(f"弹幕发送间隔最短为{MIN_SEND_INTERVAL}秒")
+        self._update_estimate()
+
+    def _update_limit_widgets(self) -> None:
+        self.count_spin.setEnabled(self.count_check.isChecked())
+        self.minutes_spin.setEnabled(self.minutes_check.isChecked())
+        for edit in (self.window_start_edit, self.window_end_edit):
+            edit.setEnabled(self.window_check.isChecked())
 
     def _update_save_button(self) -> None:
         if not hasattr(self, "buttons"):
             return
-        if self.story_radio.isChecked():
+        mode = self._mode()
+        if mode == MODE_STORY:
             content_ok = bool(self._story_hash)
+        elif mode == MODE_REPEAT:
+            content_ok = bool(self.msg_edit.text().strip()) or self.emoticon_strip.count() > 0
         else:
-            content_ok = bool(self.msg_edit.text().strip())
+            content_ok = True
         self.buttons.button(QDialogButtonBox.StandardButton.Save).setEnabled(self._resolved is not None and content_ok)
 
 

@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import html
 import logging
+import os
 import sys
+from collections import deque
+from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -16,6 +19,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
     QCheckBox,
+    QComboBox,
     QDialog,
     QFileDialog,
     QFrame,
@@ -39,7 +43,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import bili_api, config, secure_store, story, system, updater
+from . import backup, bili_api, config, secure_store, story, system, updater
 from .bili_api import AccountInfo, Credentials
 from .config import (
     APP_ID,
@@ -65,6 +69,8 @@ from .ui_common import (
     hint_label,
     log_timestamp,
     make_app_icon,
+    nav_icon,
+    plain_tip,
     run_async,
 )
 from .ui_dialogs import LoginDialog, fetch_account, show_notice
@@ -79,9 +85,14 @@ COLUMNS = ["启用", "主播", "房间号", "状态", "弹幕内容", "间隔", 
 COL_ENABLED, COL_NAME, COL_ROOM, COL_STATUS, COL_MESSAGE, COL_INTERVAL, COL_SENT, COL_LAST = range(len(COLUMNS))
 
 SESSION_HINT = "只影响当前这一段（这场直播，或这次未开播期间），开播或下播后照常自动处理"
+WAIT_HINT = "开始监控（勾选、程序启动）时主播已经在播，或者未开播但设置了“未开播时也发送”：\n这一段点“本场开始发送”才发送，下次开播会自动发送"
 
 PAGE_ROOMS, PAGE_FAVORITES, PAGE_HISTORY, PAGE_SETTINGS = range(4)
 AVATAR_SIZE = 36
+NAV_ICON_SIZE = 18
+LOG_LINES = 2000  # 运行日志面板最多留这么多条，内存不会越用越多
+# 运行日志的筛选：（显示的文字, 显示哪些级别，None 表示全部）
+LOG_FILTERS = [("全部", None), ("警告和错误", ("warn", "error")), ("只看错误", ("error",))]
 
 
 def _dot(color: str) -> str:
@@ -110,11 +121,13 @@ class MainWindow(QMainWindow):
         self._tray_hint_shown = False
         self._notice_pending = False
         self._updating_table = False
+        self._log_entries: deque[tuple[str, str, str]] = deque(maxlen=LOG_LINES)  # (时间, 级别, 内容)
 
-        self.engine = Engine(self.cfg.poll_interval_sec, self.cfg.on_start_live, history=self.history)
+        self.engine = Engine(self.cfg.poll_interval_sec, history=self.history)
         self.engine.room_changed.connect(self._on_room_changed)
         self.engine.log_message.connect(self._append_log)
         self.engine.notify.connect(self._notify)
+        self.engine.remind.connect(self._remind)
         self.engine.open_page.connect(self._open_page)
         self.engine.auth_invalid.connect(self._on_auth_invalid)
 
@@ -155,6 +168,8 @@ class MainWindow(QMainWindow):
         self.settings_page.saved.connect(self._save_settings)
         self.settings_page.update_requested.connect(self._update_from_zip)
         self.settings_page.notice_requested.connect(lambda: show_notice(self))
+        self.settings_page.backup_requested.connect(self._export_backup)
+        self.settings_page.restore_requested.connect(self._restore_backup)
         self.pages.addWidget(rooms_page)
         self.pages.addWidget(self.favorites_page)
         self.pages.addWidget(self.history_page)
@@ -214,7 +229,7 @@ class MainWindow(QMainWindow):
         # 第二行：全选（启用 / 停用全部）、搜索、多选提示
         self.all_check = QCheckBox("全选")
         self.all_check.setTristate(True)
-        self.all_check.setToolTip("勾上＝启用列表里全部直播间的监控，取消＝全部停用。搜索时只作用于搜到的直播间")
+        self.all_check.setToolTip("勾上＝监控列表里的全部直播间，取消＝全部不监控。搜索时只作用于搜到的直播间")
         self.all_check.clicked.connect(self._toggle_all_enabled)
         self.room_search = QLineEdit()
         self.room_search.setPlaceholderText("搜索主播、房间号或弹幕内容")
@@ -271,11 +286,23 @@ class MainWindow(QMainWindow):
         # ---- 运行日志
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
-        self.log_view.setMaximumBlockCount(2000)
+        self.log_view.setMaximumBlockCount(LOG_LINES)
+        self.log_level_combo = QComboBox()
+        for label, levels in LOG_FILTERS:
+            self.log_level_combo.addItem(label, levels)
+        self.log_level_combo.currentIndexChanged.connect(self._render_log)
+        self.log_search = QLineEdit()
+        self.log_search.setPlaceholderText("搜索日志")
+        self.log_search.setClearButtonEnabled(True)
+        self.log_search.setMaximumWidth(260)
+        self.log_search.textChanged.connect(self._render_log)
         clear_btn = QPushButton("清空")
-        clear_btn.clicked.connect(self.log_view.clear)
+        clear_btn.clicked.connect(self._clear_log)
         log_bar = QHBoxLayout()
         log_bar.addWidget(self._section_title("运行日志"))
+        log_bar.addSpacing(8)
+        log_bar.addWidget(self.log_level_combo)
+        log_bar.addWidget(self.log_search, 1)
         log_bar.addStretch(1)
         log_bar.addWidget(clear_btn)
 
@@ -329,18 +356,20 @@ class MainWindow(QMainWindow):
         self.nav_group = QButtonGroup(self)
         self.nav_group.setExclusive(True)
 
-        def nav_button(text: str, page: int) -> QPushButton:
+        def nav_button(text: str, page: int, icon: str) -> QPushButton:
             button = QPushButton(text)
+            button.setIcon(nav_icon(icon))  # 图标在左，文字紧跟在图标右边
+            button.setIconSize(QSize(NAV_ICON_SIZE, NAV_ICON_SIZE))
             button.setProperty("nav", True)
             button.setCheckable(True)
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             self.nav_group.addButton(button, page)
             return button
 
-        self.nav_rooms = nav_button("直播间", PAGE_ROOMS)
-        self.nav_favorites = nav_button("弹幕收藏夹", PAGE_FAVORITES)
-        self.nav_history = nav_button("历史记录", PAGE_HISTORY)
-        self.nav_settings = nav_button("设置", PAGE_SETTINGS)
+        self.nav_rooms = nav_button("直播间", PAGE_ROOMS, "rooms")
+        self.nav_favorites = nav_button("弹幕收藏夹", PAGE_FAVORITES, "favorites")
+        self.nav_history = nav_button("历史记录", PAGE_HISTORY, "history")
+        self.nav_settings = nav_button("设置", PAGE_SETTINGS, "settings")
         self.nav_group.idClicked.connect(self._show_page)
         self.nav_rooms.setChecked(True)
 
@@ -421,7 +450,7 @@ class MainWindow(QMainWindow):
     def _room_matches(self, room: RoomConfig, keyword: str) -> bool:
         if not keyword:
             return True
-        fields = [self._room_name(room), str(room.room_id), room.message, room.story_title]
+        fields = [self._room_name(room), str(room.room_id), room.message, room.story_title, *(e["name"] for e in room.emoticons)]
         return any(keyword in field.lower() for field in fields)
 
     def _apply_room_filter(self) -> None:
@@ -465,7 +494,7 @@ class MainWindow(QMainWindow):
         for room in changed:
             room.enabled = target
         if changed:
-            self._log("info", f"已{'启用' if target else '停用'} {len(changed)} 个直播间的监控")
+            self._log("info", f"已{'开始' if target else '取消'}监控 {len(changed)} 个直播间")
             self._rooms_changed()
         else:
             self._update_all_check()
@@ -498,7 +527,7 @@ class MainWindow(QMainWindow):
         font = item.font()
         font.setBold(bold)
         item.setFont(font)
-        item.setToolTip(tooltip)
+        item.setToolTip(plain_tip(tooltip))  # 直播标题、主播昵称、表情名字都是别人定的
 
     def _fill_row(self, row: int, room: RoomConfig) -> None:
         view = self.engine.view(room.room_id)
@@ -513,21 +542,29 @@ class MainWindow(QMainWindow):
         self._set_cell(row, COL_NAME, self._room_name(room), tooltip=f"直播标题：{title}" if title else "")
         self._set_cell(row, COL_ROOM, str(room.room_id))
         text, color, bold = self._status_of(room, view)
-        self._set_cell(row, COL_STATUS, text, color, bold)
+        status_tip = WAIT_HINT if room.enabled and view is not None and view.session is Session.WAIT_NEXT and room.sends else ""
+        self._set_cell(row, COL_STATUS, text, color, bold, tooltip=status_tip)
         content, content_tip = self._content_text(room, view)
         self._set_cell(row, COL_MESSAGE, content, tooltip=content_tip)
-        self._set_cell(row, COL_INTERVAL, room.interval_text())
-        counting = view is not None and view.session in (Session.SENDING, Session.STOPPED, Session.MUTED, Session.FINISHED)
-        self._set_cell(row, COL_SENT, f"{view.sent_count} 条" if counting else "—")
+        self._set_cell(row, COL_INTERVAL, room.interval_text(), tooltip=room.limits_text())
+        counting = view is not None and view.session in (
+            Session.SENDING, Session.STOPPED, Session.MUTED, Session.FINISHED, Session.LIMITED
+        )
+        self._set_cell(row, COL_SENT, f"{view.sent_count} 条" if counting and room.sends else "—")
         last = view.last_result if view else ""
         last_color = None if not last else (self.colors.ok if view.last_ok else self.colors.error)
         self._set_cell(row, COL_LAST, last, last_color)
 
     @staticmethod
     def _content_text(room: RoomConfig, view: RoomView | None) -> tuple[str, str]:
-        """“弹幕内容”一列：独轮车显示那句话；说书人显示标题和进度。返回（文字, 提示）。"""
+        """“弹幕内容”一列：独轮车显示那句话（和选的表情）；说书人显示标题和进度。返回（文字, 提示）。"""
+        if not room.sends:
+            return "【只提醒】", "开播、下播时提醒，不发弹幕"
         if room.mode != MODE_STORY:
-            return room.message, room.message
+            tip = room.repeat_text(max_names=len(room.emoticons))
+            if room.repeat_random and len(room.repeat_items()) > 1:
+                tip += "（随机顺序）"
+            return room.repeat_text(), tip
         if view and view.story_len:
             progress = f"{view.story_pos / view.story_len:.1%}"
             tip = f"说书进度：已说到第 {view.story_pos:,} 字，剩余 {view.story_len - view.story_pos:,} 字"
@@ -539,7 +576,7 @@ class MainWindow(QMainWindow):
         """返回（状态文字, 颜色, 是否加粗）。"""
         c = self.colors
         if not room.enabled:
-            return "已停用", c.muted, False
+            return "未监控", c.muted, False
         if self.engine.is_paused():
             return "监控已暂停", c.muted, False
         if view and view.story_missing:
@@ -552,18 +589,24 @@ class MainWindow(QMainWindow):
             prefix = "直播中"
         else:
             prefix = "未开播（轮播中）" if view.live_status == bili_api.LIVE_ROUND else "未开播"
+        if not room.sends:
+            return f"{prefix} · 只提醒", (c.ok if view.live else c.muted), bool(view.live)
         if view.session is Session.IDLE:
             return prefix, c.muted, False
         if view.session is Session.WAIT_NEXT:
-            return f"{prefix} · 本次直播不发送", c.warn, True
+            return f"{prefix} · 等待手动开始发送", c.warn, True
         if view.session is Session.STOPPED:
             return f"{prefix} · 已停发", c.warn, True
         if view.session is Session.MUTED:
             return f"{prefix} · 被禁言，已停发", c.error, True
         if view.session is Session.FINISHED:
             return f"{prefix} · 说书已说完", c.warn, True
+        if view.session is Session.LIMITED:
+            return f"{prefix} · 已达本场上限，已停发", c.warn, True
         if not self.engine.has_credentials():
             return f"{prefix} · 未登录，没有发送", c.warn, True
+        if not room.in_window(datetime.now()):
+            return f"{prefix} · 不在发送时段（{room.window_text()}）", c.warn, True
         return f"{prefix} · 正在发送", c.ok, True
 
     def _room_name(self, room: RoomConfig) -> str:
@@ -599,7 +642,7 @@ class MainWindow(QMainWindow):
         if room is None or room.enabled == enabled:
             return
         room.enabled = enabled
-        self._log("info", f"[{self._room_name(room)}] 已{'启用' if enabled else '停用'}监控")
+        self._log("info", f"[{self._room_name(room)}] 已{'开始' if enabled else '取消'}监控")
         self._rooms_changed()
 
     def _on_room_changed(self, room_id: int) -> None:
@@ -640,7 +683,7 @@ class MainWindow(QMainWindow):
     # ---- 直播间操作
 
     def _add_room(self) -> None:
-        dialog = RoomDialog(self, None, {room.room_id for room in self.cfg.rooms}, self.favorites)
+        dialog = RoomDialog(self, None, {room.room_id for room in self.cfg.rooms}, self.favorites, creds=lambda: self.creds)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         room = dialog.result_config()
@@ -658,7 +701,7 @@ class MainWindow(QMainWindow):
         view = self.engine.view(room.room_id)
         progress = (view.story_pos, view.story_len) if view and view.story_len else None
         taken = {r.room_id for r in self.cfg.rooms if r.room_id != room.room_id}
-        dialog = RoomDialog(self, room, taken, self.favorites, progress)
+        dialog = RoomDialog(self, room, taken, self.favorites, progress, creds=lambda: self.creds)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         updated = dialog.result_config()
@@ -714,11 +757,18 @@ class MainWindow(QMainWindow):
         rooms = self._selected_rooms()
         if not rooms:
             return
+        notify_only = [room for room in rooms if not room.sends]
+        rooms = [room for room in rooms if room.sends]
+        if notify_only and not rooms:
+            QMessageBox.information(
+                self, APP_TITLE, "“只提醒”的直播间不发弹幕。想发弹幕的话，编辑直播间，把模式改成独轮车或说书人。"
+            )
+            return
         disabled = [room for room in rooms if not room.enabled]
         not_live = [room for room in rooms if room.enabled and not self.engine.start_session(room.room_id)]
-        if len(rooms) == 1:
+        if len(rooms) == 1 and not notify_only:
             if disabled:
-                QMessageBox.information(self, APP_TITLE, "这个直播间已停用，先在“启用”那一列打勾。")
+                QMessageBox.information(self, APP_TITLE, "这个直播间没有监控，先在“启用”那一列打勾。")
             elif not_live:
                 QMessageBox.information(
                     self,
@@ -726,13 +776,15 @@ class MainWindow(QMainWindow):
                     "主播现在没在直播（或还没检测出结果），开播后会自动开始发送。\n"
                     "想在未开播时也发送，可以编辑这个直播间，勾选“未开播时也发送弹幕”。",
                 )
-        elif disabled or not_live:
+        elif disabled or not_live or notify_only:
             started = len(rooms) - len(disabled) - len(not_live)
             parts = [f"{started} 个已开始发送"]
             if not_live:
                 parts.append(f"{len(not_live)} 个主播没在直播（开播后会自动发送）")
             if disabled:
-                parts.append(f"{len(disabled)} 个已停用")
+                parts.append(f"{len(disabled)} 个没有监控")
+            if notify_only:
+                parts.append(f"{len(notify_only)} 个是“只提醒”，不发弹幕")
             QMessageBox.information(self, APP_TITLE, "，".join(parts) + "。")
 
     def _stop_session(self) -> None:
@@ -810,7 +862,7 @@ class MainWindow(QMainWindow):
         else:
             text, tip = "未登录\n点击登录", "登录后才能发送弹幕"
         self.account_btn.setText(text)
-        self.account_btn.setToolTip(tip)
+        self.account_btn.setToolTip(plain_tip(tip))
         avatar = self._avatar if state == "ok" else None
         self.account_btn.setIcon(QIcon(circle_avatar(avatar, AVATAR_SIZE)))
         color = {"invalid": self.colors.error, "none": self.colors.warn}.get(state)
@@ -949,7 +1001,6 @@ class MainWindow(QMainWindow):
         page.apply_to(self.cfg)
         self._save_config()
         self.engine.set_poll_interval(self.cfg.poll_interval_sec)
-        self.engine.set_on_start_live(self.cfg.on_start_live)
         if page.autostart_checked() != system.is_autostart_enabled():
             try:
                 system.set_autostart(page.autostart_checked())
@@ -971,20 +1022,54 @@ class MainWindow(QMainWindow):
         self._append_log(level, text)
 
     def _append_log(self, level: str, text: str) -> None:
+        entry = (log_timestamp(), level, text)
+        self._log_entries.append(entry)  # 全部留着（最多 LOG_LINES 条），换筛选条件时重新显示
+        if self._log_visible(entry):
+            self.log_view.appendHtml(self._log_html(entry))
+
+    def _log_visible(self, entry: tuple[str, str, str]) -> bool:
+        _stamp, level, text = entry
+        levels = self.log_level_combo.currentData()
+        keyword = self.log_search.text().strip().lower()
+        return (levels is None or level in levels) and (not keyword or keyword in text.lower())
+
+    def _log_html(self, entry: tuple[str, str, str]) -> str:
+        stamp, level, text = entry
         color = {"warn": self.colors.warn, "error": self.colors.error}.get(level)
         body = html.escape(text)
         if color:
             body = f'<span style="color:{color}">{body}</span>'
-        self.log_view.appendHtml(f'<span style="color:{self.colors.muted}">{log_timestamp()}</span>&nbsp;&nbsp;{body}')
+        return f'<span style="color:{self.colors.muted}">{stamp}</span>&nbsp;&nbsp;{body}'
+
+    def _render_log(self) -> None:
+        """换了筛选条件：按条件重新显示日志。"""
+        self.log_view.setUpdatesEnabled(False)
+        self.log_view.clear()
+        for entry in self._log_entries:
+            if self._log_visible(entry):
+                self.log_view.appendHtml(self._log_html(entry))  # 一条一个段落，超过上限时才能一条条地挤掉旧的
+        self.log_view.setUpdatesEnabled(True)
+        scrollbar = self.log_view.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def _clear_log(self) -> None:
+        self._log_entries.clear()
+        self.log_view.clear()
 
     def _notify(self, title: str, text: str) -> None:
         if self.tray and self.cfg.notify:
             self.tray.showMessage(title, text, make_app_icon(), 6000)
 
+    def _remind(self, title: str, text: str) -> None:
+        """“只提醒”直播间的开播 / 下播提醒：这些直播间就是为了提醒才加的，不看“系统通知”开关。"""
+        if self.tray:
+            self.tray.showMessage(title, text, make_app_icon(), 10000)
+
     def _confirm(self, title: str, text: str, yes_text: str) -> bool:
         box = QMessageBox(self)
         box.setWindowTitle(title)
         box.setIcon(QMessageBox.Icon.Question)
+        box.setTextFormat(Qt.TextFormat.PlainText)  # 里面有主播昵称、备份文件里写的信息
         box.setText(text)
         yes = box.addButton(yes_text, QMessageBox.ButtonRole.AcceptRole)
         box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
@@ -1058,6 +1143,63 @@ class MainWindow(QMainWindow):
             self.cfg.close_action = choice
             self._save_config()
         return choice
+
+    # ------------------------------------------------------------ 数据备份和恢复
+
+    def _export_backup(self) -> None:
+        documents = Path.home() / "Documents"
+        folder = documents if documents.exists() else Path.home()
+        path, _ = QFileDialog.getSaveFileName(self, "导出备份", str(folder / backup.default_name()), "压缩包 (*.zip)")
+        if not path:
+            return
+
+        def on_done(info: backup.BackupInfo) -> None:
+            self._log("info", f"已导出备份：{path}（{len(info.files)} 个文件）")
+            QMessageBox.information(self, "导出备份", f"已导出到：\n{path}\n\n共 {len(info.files)} 个文件。换电脑时在新电脑上“从备份恢复”就行。")
+
+        run_async(self, backup.export_backup, Path(path), on_done=on_done,
+                  on_error=lambda message: QMessageBox.warning(self, "导出备份", message))
+
+    def _restore_backup(self) -> None:
+        documents = Path.home() / "Documents"
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择备份", str(documents if documents.exists() else Path.home()), "压缩包 (*.zip)"
+        )
+        if not path:
+            return
+        try:
+            info = backup.read_backup(Path(path))
+        except backup.BackupError as e:
+            QMessageBox.warning(self, "从备份恢复", str(e))
+            return
+        made = f"{info.created} 导出" if info.created else "导出时间不明"
+        question = (
+            f"恢复这个备份（{made}，版本 {info.version or '不明'}，{len(info.files)} 个文件）？\n\n"
+            "现在的直播间和设置、收藏夹、历史记录、说书文字和进度会被替换成备份里的。"
+            f"替换前会自动把现在的数据另存到数据文件夹里的“{backup.PRE_RESTORE_PREFIX}时间.zip”。\n\n"
+            "程序会关闭并自动重新打开。"
+        )
+        if not self._confirm("从备份恢复", question, "恢复"):
+            return
+        try:
+            backup.stage_restore(Path(path))
+        except backup.BackupError as e:
+            QMessageBox.warning(self, "从备份恢复", str(e))
+            return
+        self._log("info", f"准备恢复备份：{path}，程序重新打开时换上")
+        try:
+            system.relaunch(["--wait-pid", str(os.getpid())])
+        except OSError as e:
+            QMessageBox.information(self, "从备份恢复", f"没能自动重新打开程序（{e}）。\n请稍后自己打开程序，打开时会自动恢复。")
+        self.quit_app("恢复备份")
+
+    def show_restore_result(self, result: backup.RestoreResult) -> None:
+        """恢复备份后重新打开时调用：告诉用户恢复得怎么样。"""
+        previous = f"\n\n恢复前的数据另存在：\n{result.previous}" if result.previous else ""
+        if result.ok:
+            QMessageBox.information(self, "从备份恢复", result.message + previous)
+        else:
+            QMessageBox.warning(self, "从备份恢复", result.message + previous)
 
     # ------------------------------------------------------------ 从压缩包更新
 
@@ -1178,6 +1320,13 @@ def run(argv: list[str]) -> int:
     app.setQuitOnLastWindowClosed(False)  # 窗口缩到托盘时程序不能退出
     translated = _install_qt_translation(app)
 
+    if "--wait-pid" in argv:  # 恢复备份后重新打开：等旧程序完全退出，不然会被当成“已经在运行”
+        index = argv.index("--wait-pid")
+        try:
+            updater.wait_for_exit(int(argv[index + 1]), timeout_ms=30_000)
+        except (IndexError, ValueError):
+            pass
+
     # 同一时间只允许运行一个，否则两个程序会重复发弹幕。再打开一次就把已有的窗口叫出来。
     probe = QLocalSocket()
     probe.connectToServer(SINGLE_INSTANCE_KEY)
@@ -1200,6 +1349,10 @@ def run(argv: list[str]) -> int:
     except OSError:
         pass
 
+    restored = backup.apply_pending_restore()  # 要在打开数据库（创建 MainWindow）之前
+    if restored is not None:
+        (log.info if restored.ok else log.warning)("从备份恢复：%s 恢复前的数据：%s", restored.message, restored.previous)
+
     window = MainWindow()
 
     def on_new_connection() -> None:
@@ -1214,9 +1367,11 @@ def run(argv: list[str]) -> int:
         index = argv.index("--updated-from")
         window.after_update(argv[index + 1] if index + 1 < len(argv) else "旧版本")
 
-    if "--minimized" in argv and window.tray is not None:
+    if "--minimized" in argv and window.tray is not None and restored is None:
         if window.creds is None:
             window._notify("还没有登录", "打开程序登录后，开播时才能自动发送弹幕")
     else:
         window.show()
+    if restored is not None:
+        QTimer.singleShot(800, lambda: window.show_restore_result(restored))
     return app.exec()

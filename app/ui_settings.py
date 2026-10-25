@@ -25,7 +25,6 @@ from .config import (
     CLOSE_CHOICES,
     MAX_POLL_INTERVAL,
     MIN_POLL_INTERVAL,
-    ON_START_CHOICES,
     AppConfig,
     data_dir,
 )
@@ -45,6 +44,8 @@ class SettingsPage(QWidget):
     saved = Signal()
     update_requested = Signal()  # 点了“从压缩包更新”
     notice_requested = Signal()  # 点了“使用须知”
+    backup_requested = Signal()  # 点了“导出备份”
+    restore_requested = Signal()  # 点了“从备份恢复”
 
     def __init__(self, parent: QWidget | None = None):
         super().__init__(parent)
@@ -55,7 +56,6 @@ class SettingsPage(QWidget):
         self.poll_spin.setRange(MIN_POLL_INTERVAL, MAX_POLL_INTERVAL)
         self.poll_spin.setFixedWidth(100)
         self.auto_monitor_check = QCheckBox("程序启动后自动检测直播间状态")
-        self.on_start_combo = _combo(ON_START_CHOICES)
         self.browser_combo = _combo(BROWSER_CHOICES)
         self.close_combo = _combo(CLOSE_CHOICES)
         self.notify_check = QCheckBox("开播、下播或发送出错时弹出系统通知")
@@ -70,10 +70,12 @@ class SettingsPage(QWidget):
         auto_hint = hint_label("关闭后，程序启动时先暂停监控，点“继续监控”才开始检测和发送")
         auto_hint.setWordWrap(False)
         form.addRow("", auto_hint)
-        form.addRow("若启动时监控直播间已开播：", self.on_start_combo)
         form.addRow("打开直播页用：", self.browser_combo)
         form.addRow("关闭窗口时：", self.close_combo)
         form.addRow("", self.notify_check)
+        notify_hint = hint_label("“只提醒”的直播间不受这个开关影响，开播、下播总会提醒")
+        notify_hint.setWordWrap(False)
+        form.addRow("", notify_hint)
         form.addRow("", self.autostart_check)
 
         folder = str(data_dir())
@@ -84,6 +86,15 @@ class SettingsPage(QWidget):
         folder_row = QHBoxLayout()
         folder_row.addWidget(folder_label, 1)
         folder_row.addWidget(open_btn)
+
+        backup_btn = QPushButton("导出备份…")
+        backup_btn.clicked.connect(self.backup_requested.emit)
+        restore_btn = QPushButton("从备份恢复…")
+        restore_btn.clicked.connect(self.restore_requested.emit)
+        backup_row = QHBoxLayout()
+        backup_row.addWidget(hint_label("备份包含直播间和设置、收藏夹、历史记录、说书文字和进度、屏蔽词整理表（不含登录和运行日志）"), 1)
+        backup_row.addWidget(backup_btn)
+        backup_row.addWidget(restore_btn)
 
         self.save_btn = QPushButton("保存设置")
         self.save_btn.setDefault(True)
@@ -108,6 +119,7 @@ class SettingsPage(QWidget):
         box.addLayout(save_row)
         box.addSpacing(12)
         box.addLayout(folder_row)
+        box.addLayout(backup_row)
         version_row = QHBoxLayout()
         version_label = hint_label(f"{APP_TITLE} {APP_VERSION}")
         version_label.setWordWrap(False)
@@ -137,7 +149,6 @@ class SettingsPage(QWidget):
     def load(self, cfg: AppConfig, autostart: bool) -> None:
         self.poll_spin.setValue(cfg.poll_interval_sec)
         self.auto_monitor_check.setChecked(cfg.auto_monitor)
-        self.on_start_combo.setCurrentIndex(self.on_start_combo.findData(cfg.on_start_live))
         self.browser_combo.setCurrentIndex(self.browser_combo.findData(cfg.browser))
         self.close_combo.setCurrentIndex(self.close_combo.findData(cfg.close_action))
         self.notify_check.setChecked(cfg.notify)
@@ -147,7 +158,6 @@ class SettingsPage(QWidget):
     def apply_to(self, cfg: AppConfig) -> None:
         cfg.poll_interval_sec = self.poll_spin.value()
         cfg.auto_monitor = self.auto_monitor_check.isChecked()
-        cfg.on_start_live = self.on_start_combo.currentData()
         cfg.browser = self.browser_combo.currentData()
         cfg.close_action = self.close_combo.currentData()
         cfg.notify = self.notify_check.isChecked()

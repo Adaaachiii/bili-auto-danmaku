@@ -19,7 +19,7 @@ sys.path.insert(0, str(ROOT))
 from PySide6.QtCore import QCoreApplication
 
 from app import bili_api, story
-from app.config import MODE_STORY, ON_START_SEND_ONLY, RoomConfig
+from app.config import MODE_STORY, RoomConfig
 from app.engine import Engine, Session
 from app.story import StoryText
 
@@ -48,13 +48,22 @@ assert "".join(pieces).replace(" ", "") == t.stream.replace(" ", "")
 assert t.next_chunk(0, 10, by_line=True) == ("第一章 开始", 6)  # 到行尾为止
 assert t.next_chunk(6, 10, by_line=True) == ("这是第一行，内容比较", 16)  # 行太长时照样按字数切
 assert t.next_chunk(16, 10, by_line=True) == ("长一些。", 20)
+# 预计条数：和真的一条条切出来的一样多
+assert story.count_chunks(t, 5, by_line=False) == len(pieces)
+assert story.count_chunks(t, 10, by_line=True) == 4 and story.count_chunks(t, 10, by_line=True, start=16) == 2
 print("切分规则 OK")
 
+
+
+def live(e, room_id=1):
+    """模拟“开播”：先查到未开播，再查到开播（开始监控时就已在播的那一场要手动开始，见 engine.Session.WAIT_NEXT）。"""
+    e._apply_status(room_id, OFF, "", "")
+    e._apply_status(room_id, ON, "", "")
 
 def make(text, **kw):
     hash_, chars = story.text_fingerprint(text)
     story.save_room_story(1, text)
-    e = Engine(30, ON_START_SEND_ONLY)
+    e = Engine(30)
     e.set_credentials(bili_api.Credentials("x", "y"))
     room = RoomConfig(room_id=1, uid=1, mode=MODE_STORY, story_hash=hash_, story_chars=chars, story_chunk_size=4, **kw)
     e.set_rooms([room])
@@ -70,7 +79,7 @@ def tick(e):
 # ---- 按顺序说，说完停止
 sent.clear()
 e, room = make("一二三四五六七八九十")
-e._apply_status(1, ON, "", "")
+live(e)
 for _ in range(5):
     tick(e)
 assert sent == ["一二三四", "五六七八", "九十"], sent
@@ -80,7 +89,7 @@ print("说完停止 OK")
 # ---- 从头循环
 sent.clear()
 e, room = make("一二三四五六", story_loop=True)
-e._apply_status(1, ON, "", "")
+live(e)
 for _ in range(4):
     tick(e)
 assert sent == ["一二三四", "五六", "一二三四", "五六"], sent
@@ -90,15 +99,15 @@ print("从头循环 OK")
 for inherit, expect in ((True, "五六七八"), (False, "一二三四")):
     sent.clear()
     e, room = make("一二三四五六七八九十", story_inherit=inherit)
-    e._apply_status(1, ON, "", ""); tick(e)
+    live(e); tick(e)
     e._apply_status(1, OFF, "", ""); e._apply_status(1, OFF, "", "")
     assert e.view(1).session is Session.IDLE
-    e._apply_status(1, ON, "", ""); tick(e)
+    live(e); tick(e)
     assert sent[-1] == expect, (inherit, sent)
 print("状态继承 OK")
 
 # ---- 程序重启后进度还在（继承开启时）
-e2 = Engine(30, ON_START_SEND_ONLY)
+e2 = Engine(30)
 e2.set_credentials(bili_api.Credentials("x", "y"))
 e2.set_rooms([replace(room, story_inherit=True)])
 assert e2.view(1).story_pos == 4, e2.view(1).story_pos
@@ -107,7 +116,7 @@ print("重启后进度保留 OK")
 # ---- 被过滤的段落跳过，限流的段落重发
 sent.clear()
 e, room = make("一二三四五六七八九十")
-e._apply_status(1, ON, "", "")
+live(e)
 next_outcome[0] = bili_api.SendOutcome.FILTERED; tick(e)
 next_outcome[0] = bili_api.SendOutcome.RATE_LIMITED; tick(e)
 next_outcome[0] = bili_api.SendOutcome.OK; tick(e)
@@ -116,7 +125,7 @@ print("过滤跳过 / 限流重发 OK")
 
 # ---- 换了文字，进度从头
 e, room = make("一二三四五六七八九十", story_inherit=True)
-e._apply_status(1, ON, "", ""); tick(e)
+live(e); tick(e)
 hash_, chars = story.text_fingerprint("甲乙丙丁戊己庚辛")
 story.save_room_story(1, "甲乙丙丁戊己庚辛")
 e.set_rooms([replace(room, story_hash=hash_, story_chars=chars)])
