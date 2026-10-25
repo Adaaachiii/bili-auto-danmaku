@@ -28,7 +28,7 @@ from .config import (
     AppConfig,
     data_dir,
 )
-from .ui_common import StatusColors, hint_label, unit_row
+from .ui_common import StatusColors, hint_label, set_colored, unit_row
 
 
 def _combo(choices: dict[str, str]) -> QComboBox:
@@ -43,6 +43,8 @@ class SettingsPage(QWidget):
 
     saved = Signal()
     update_requested = Signal()  # 点了“从压缩包更新”
+    check_update_requested = Signal()  # 点了“检查更新”
+    install_update_requested = Signal()  # 点了“更新到 x.y.z”
     notice_requested = Signal()  # 点了“使用须知”
     backup_requested = Signal()  # 点了“导出备份”
     restore_requested = Signal()  # 点了“从备份恢复”
@@ -60,6 +62,7 @@ class SettingsPage(QWidget):
         self.close_combo = _combo(CLOSE_CHOICES)
         self.notify_check = QCheckBox("开播、下播或发送出错时弹出系统通知")
         self.autostart_check = QCheckBox("开机自动启动（启动后直接缩小到托盘）")
+        self.auto_update_check = QCheckBox("自动检查更新")
 
         form = QFormLayout()
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
@@ -77,6 +80,10 @@ class SettingsPage(QWidget):
         notify_hint.setWordWrap(False)
         form.addRow("", notify_hint)
         form.addRow("", self.autostart_check)
+        form.addRow("", self.auto_update_check)
+        update_hint = hint_label("每天查一次 GitHub 上有没有新版本，GitHub 只看得到你的 IP 和程序版本号")
+        update_hint.setWordWrap(False)
+        form.addRow("", update_hint)
 
         folder = str(data_dir())
         folder_label = hint_label(f"配置、收藏夹和日志保存在：{folder}")
@@ -92,7 +99,7 @@ class SettingsPage(QWidget):
         restore_btn = QPushButton("从备份恢复…")
         restore_btn.clicked.connect(self.restore_requested.emit)
         backup_row = QHBoxLayout()
-        backup_row.addWidget(hint_label("备份包含直播间和设置、收藏夹、历史记录、说书文字和进度、屏蔽词整理表（不含登录和运行日志）"), 1)
+        backup_row.addWidget(hint_label("备份包含直播间和设置、收藏夹、历史记录、说书文字和进度、屏蔽词整理表（不含登录、运行日志和表情图片）"), 1)
         backup_row.addWidget(backup_btn)
         backup_row.addWidget(restore_btn)
 
@@ -124,6 +131,9 @@ class SettingsPage(QWidget):
         version_label = hint_label(f"{APP_TITLE} {APP_VERSION}")
         version_label.setWordWrap(False)
         version_row.addWidget(version_label)
+        self.check_btn = QPushButton("检查更新")
+        self.check_btn.clicked.connect(self.check_update_requested.emit)
+        version_row.addWidget(self.check_btn)
         if getattr(sys, "frozen", False):
             update_btn = QPushButton("从压缩包更新…")
             update_btn.setToolTip("选择从 GitHub Releases 下载的新版本压缩包，程序会自动替换并重新打开，数据不受影响")
@@ -138,6 +148,17 @@ class SettingsPage(QWidget):
         version_row.addWidget(notice_btn)
         version_row.addStretch(1)
         box.addLayout(version_row)
+        # 检查更新的结果：已是最新 / 有新版本（旁边是“更新到 x.y.z…”按钮）/ 出错
+        self.update_label = hint_label()
+        self.update_label.setWordWrap(False)
+        self.install_btn = QPushButton()
+        self.install_btn.clicked.connect(self.install_update_requested.emit)
+        update_row = QHBoxLayout()
+        update_row.addWidget(self.update_label)
+        update_row.addWidget(self.install_btn)
+        update_row.addStretch(1)
+        box.addLayout(update_row)
+        self.show_update_status("")
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 14, 16, 14)
@@ -153,6 +174,7 @@ class SettingsPage(QWidget):
         self.close_combo.setCurrentIndex(self.close_combo.findData(cfg.close_action))
         self.notify_check.setChecked(cfg.notify)
         self.autostart_check.setChecked(autostart)
+        self.auto_update_check.setChecked(cfg.auto_check_update)
         self.saved_label.clear()
 
     def apply_to(self, cfg: AppConfig) -> None:
@@ -161,9 +183,22 @@ class SettingsPage(QWidget):
         cfg.browser = self.browser_combo.currentData()
         cfg.close_action = self.close_combo.currentData()
         cfg.notify = self.notify_check.isChecked()
+        cfg.auto_check_update = self.auto_update_check.isChecked()
 
     def autostart_checked(self) -> bool:
         return self.autostart_check.isChecked()
+
+    def show_update_status(self, text: str, color: str = "", new_version: str | None = None) -> None:
+        """检查更新的结果。new_version 不为空时显示“更新到 x.y.z…”按钮（源码版没有这个按钮，用 git pull 更新）。"""
+        set_colored(self.update_label, text, color or StatusColors().muted)
+        self.update_label.setVisible(bool(text))
+        self.install_btn.setVisible(new_version is not None and getattr(sys, "frozen", False))
+        if new_version:
+            self.install_btn.setText(f"更新到 {new_version}…")
+
+    def set_checking(self, checking: bool) -> None:
+        self.check_btn.setEnabled(not checking)
+        self.check_btn.setText("正在检查…" if checking else "检查更新")
 
     def show_saved(self) -> None:
         self.saved_label.setText("✓ 已保存")

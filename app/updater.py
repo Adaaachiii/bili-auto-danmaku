@@ -28,6 +28,7 @@ from .config import APP_TITLE, APP_VERSION, data_dir_for
 
 EXE_NAME = f"{APP_TITLE}.exe"
 UPDATE_DIR = "_update"
+DOWNLOAD_NAME = f"{UPDATE_DIR}-download.zip"  # 一键更新时下载的压缩包（见 update_check），解压后就删
 KEEP = {"data", UPDATE_DIR}  # 更新时不动的东西
 _DETACHED = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
 
@@ -257,7 +258,12 @@ def _message(text: str) -> None:
 
 
 def cleanup(target: Path) -> bool:
-    """删掉更新用的临时文件夹，删干净了返回 True。"""
+    """删掉更新用的临时文件夹（和一键更新下载的压缩包），删干净了返回 True。"""
+    for leftover in (target / DOWNLOAD_NAME, target / f"{DOWNLOAD_NAME}.part"):
+        try:
+            leftover.unlink(missing_ok=True)
+        except OSError:
+            pass
     folder = target / UPDATE_DIR
     if not folder.exists():
         return True

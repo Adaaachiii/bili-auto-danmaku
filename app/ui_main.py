@@ -6,6 +6,7 @@ import html
 import logging
 import os
 import sys
+import time
 from collections import deque
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
@@ -43,7 +44,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import backup, bili_api, config, secure_store, story, system, updater
+from . import backup, bili_api, config, secure_store, story, system, update_check, updater
 from .bili_api import AccountInfo, Credentials
 from .config import (
     APP_ID,
@@ -78,6 +79,7 @@ from .ui_favorites import FavoritesPage
 from .ui_history import HistoryPage
 from .ui_room_dialog import RoomDialog
 from .ui_settings import SettingsPage
+from .ui_update import UpdateDialog
 
 log = logging.getLogger(__name__)
 
@@ -90,6 +92,8 @@ WAIT_HINT = "开始监控（勾选、程序启动）时主播已经在播，或�
 PAGE_ROOMS, PAGE_FAVORITES, PAGE_HISTORY, PAGE_SETTINGS = range(4)
 AVATAR_SIZE = 36
 NAV_ICON_SIZE = 18
+UPDATE_FIRST_CHECK_MS = 15_000  # 启动后过一会再查新版本，不和登录、检测开播挤在一起
+UPDATE_CHECK_EVERY_MS = 24 * 3600 * 1000  # 开着不关的话，每天查一次
 LOG_LINES = 2000  # 运行日志面板最多留这么多条，内存不会越用越多
 # 运行日志的筛选：（显示的文字, 显示哪些级别，None 表示全部）
 LOG_FILTERS = [("全部", None), ("警告和错误", ("warn", "error")), ("只看错误", ("error",))]
@@ -121,6 +125,9 @@ class MainWindow(QMainWindow):
         self._tray_hint_shown = False
         self._notice_pending = False
         self._updating_table = False
+        self._latest: update_check.Release | None = None  # 查到的新版本，没有新版本时是 None
+        self._checking_update = False
+        self._tray_message = ""  # 最近一条托盘通知是什么，点通知时决定打开哪一页
         self._log_entries: deque[tuple[str, str, str]] = deque(maxlen=LOG_LINES)  # (时间, 级别, 内容)
 
         self.engine = Engine(self.cfg.poll_interval_sec, history=self.history)
@@ -146,6 +153,10 @@ class MainWindow(QMainWindow):
         self._clock.start(1000)
         self._update_monitor_label()
         self._log("info", "程序已启动")
+        self._update_timer = QTimer(self)
+        self._update_timer.timeout.connect(self._check_updates)
+        self._update_timer.start(UPDATE_CHECK_EVERY_MS)
+        QTimer.singleShot(UPDATE_FIRST_CHECK_MS, self._check_updates)
         if not self.cfg.auto_monitor:
             self._show_paused(True)
             self._log("info", "按设置，启动后先不检测直播间，点“继续监控”开始")
@@ -167,6 +178,8 @@ class MainWindow(QMainWindow):
         self.settings_page = SettingsPage()
         self.settings_page.saved.connect(self._save_settings)
         self.settings_page.update_requested.connect(self._update_from_zip)
+        self.settings_page.check_update_requested.connect(lambda: self._check_updates(manual=True))
+        self.settings_page.install_update_requested.connect(self._install_latest)
         self.settings_page.notice_requested.connect(lambda: show_notice(self))
         self.settings_page.backup_requested.connect(self._export_backup)
         self.settings_page.restore_requested.connect(self._restore_backup)
@@ -431,6 +444,7 @@ class MainWindow(QMainWindow):
         menu.addAction(quit_action)
         tray.setContextMenu(menu)
         tray.activated.connect(self._on_tray_activated)
+        tray.messageClicked.connect(self._on_tray_message_clicked)
         tray.show()
         return tray
 
@@ -1056,13 +1070,15 @@ class MainWindow(QMainWindow):
         self._log_entries.clear()
         self.log_view.clear()
 
-    def _notify(self, title: str, text: str) -> None:
+    def _notify(self, title: str, text: str, kind: str = "") -> None:
         if self.tray and self.cfg.notify:
+            self._tray_message = kind
             self.tray.showMessage(title, text, make_app_icon(), 6000)
 
     def _remind(self, title: str, text: str) -> None:
         """“只提醒”直播间的开播 / 下播提醒：这些直播间就是为了提醒才加的，不看“系统通知”开关。"""
         if self.tray:
+            self._tray_message = ""
             self.tray.showMessage(title, text, make_app_icon(), 10000)
 
     def _confirm(self, title: str, text: str, yes_text: str) -> bool:
@@ -1098,6 +1114,11 @@ class MainWindow(QMainWindow):
     def _on_tray_activated(self, reason) -> None:
         if reason in (QSystemTrayIcon.ActivationReason.Trigger, QSystemTrayIcon.ActivationReason.DoubleClick):
             self.show_window()
+
+    def _on_tray_message_clicked(self) -> None:
+        self.show_window()
+        if self._tray_message == "update":  # 点“发现新版本”的通知，直接到设置页
+            self._show_page(PAGE_SETTINGS)
 
     def closeEvent(self, event) -> None:
         if self._quitting:
@@ -1235,14 +1256,20 @@ class MainWindow(QMainWindow):
             question = f"压缩包里是 {staged.version}，{'和现在的版本一样' if same else '比现在的 ' + APP_VERSION + ' 还旧'}，仍要替换吗？"
         else:
             question = f"从 {APP_VERSION} 更新到 {staged.version}？"
-        sending = any(view and view.session is Session.SENDING for view in (self.engine.view(r.room_id) for r in self.cfg.rooms))
         detail = "程序会关闭并自动重新打开，直播间、收藏夹、历史记录等数据不受影响。"
-        if sending:
+        if self._any_sending():
             detail += "\n正在发送的直播间会中断十几秒，重新打开后照常处理。"
         answer = QMessageBox.question(self, "从压缩包更新", f"{question}\n\n{detail}")
         if answer != QMessageBox.StandardButton.Yes:
             updater.discard(target)
             return
+        self._launch_update(staged, target)
+
+    def _any_sending(self) -> bool:
+        return any(view and view.session is Session.SENDING for view in (self.engine.view(r.room_id) for r in self.cfg.rooms))
+
+    def _launch_update(self, staged: updater.StagedUpdate, target: Path) -> None:
+        """启动解压好的新版本去替换文件，自己退出。"""
         try:
             updater.launch_install(staged, target)
         except OSError as e:
@@ -1250,6 +1277,54 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "没法更新", f"启动新版本失败：{e}")
             return
         self.quit_app("程序更新")
+
+    # ------------------------------------------------------------ 检查更新、一键更新
+
+    def _check_updates(self, manual: bool = False) -> None:
+        """查 GitHub 上有没有新版本。自动查的出错（比如没网）只记进日志文件；手动查的显示在设置页。"""
+        if self._checking_update or (not manual and not self.cfg.auto_check_update):
+            return
+        self._checking_update = True
+        page = self.settings_page
+        page.set_checking(True)
+        frozen = getattr(sys, "frozen", False)
+
+        def on_done(release: update_check.Release) -> None:
+            self._checking_update = False
+            page.set_checking(False)
+            stamp = time.strftime("%H:%M")
+            if not release.newer_than(APP_VERSION):
+                self._latest = None
+                page.show_update_status(f"已是最新版本（{stamp} 检查）")
+                return
+            self._latest = release
+            hint = "" if frozen else "（源码版用 git pull 更新）"
+            page.show_update_status(f"有新版本 {release.version}{hint}", self.colors.ok, release.version)
+            if self.cfg.update_notified != release.version:  # 同一个版本只提醒一次
+                self.cfg.update_notified = release.version
+                self._save_config()
+                self._log("info", f"发现新版本 {release.version}，可以到设置页更新")
+                self._notify("发现新版本", f"{APP_TITLE} {release.version} 已发布，点这里到设置页更新", kind="update")
+
+        def on_error(message: str) -> None:
+            self._checking_update = False
+            page.set_checking(False)
+            if manual:
+                page.show_update_status(f"检查更新失败：{message}", self.colors.error)
+            else:
+                log.info("自动检查更新失败：%s", message)
+
+        run_async(self, update_check.fetch_latest, on_done=on_done, on_error=on_error)
+
+    def _install_latest(self) -> None:
+        release = self._latest
+        if release is None or not getattr(sys, "frozen", False):
+            return
+        target = updater.app_dir()
+        dialog = UpdateDialog(self, release, target, self._any_sending())
+        if dialog.exec() == QDialog.DialogCode.Accepted and dialog.staged is not None:
+            self._log("info", f"已下载并核对 {release.version}，准备更新")
+            self._launch_update(dialog.staged, target)
 
     def after_update(self, old_version: str) -> None:
         """更新完重新打开后调用：删掉临时文件，告诉用户已经更新。"""
