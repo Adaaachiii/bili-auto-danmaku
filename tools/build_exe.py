@@ -31,23 +31,22 @@ QT_LICENSE_FILES = ("LGPL-3.0.txt", "GPL-3.0.txt")
 
 
 def make_icon(path: Path) -> None:
-    """用程序里画图标的代码生成 exe 的图标（.ico 里放多种尺寸的 PNG）。
+    """用程序里画图标的代码生成 exe 的图标（.ico 里放多种尺寸的 PNG，小尺寸和大尺寸画法不同）。
 
-    不能用 offscreen 模式：那种模式下 Qt 找不到系统字体，“弹”字会画成方框。
+    每个尺寸直接按像素画，不经过 QIcon.pixmap：高分屏上那样拿到的图会按缩放比例放大，尺寸对不上。
     """
     from PySide6.QtCore import QBuffer, QByteArray, QIODevice
     from PySide6.QtWidgets import QApplication
 
-    from app.ui_common import make_app_icon
+    from app.ui_common import APP_ICON_SIZES, app_icon_pixmap
 
     app = QApplication.instance() or QApplication([])
-    icon = make_app_icon()
     images: list[tuple[int, bytes]] = []
-    for size in (16, 20, 24, 32, 40, 48, 64, 128, 256):
+    for size in APP_ICON_SIZES:
         data = QByteArray()
         buffer = QBuffer(data)
         buffer.open(QIODevice.OpenModeFlag.WriteOnly)
-        icon.pixmap(size, size).save(buffer, "PNG")
+        app_icon_pixmap(size).save(buffer, "PNG")
         images.append((size, bytes(data)))
     del app
 

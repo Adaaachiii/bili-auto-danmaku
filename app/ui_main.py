@@ -13,7 +13,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from PySide6.QtCore import QLibraryInfo, QLocale, QPoint, QSize, Qt, QTimer, QTranslator
-from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPixmap
+from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QIcon, QPixmap
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -66,12 +66,16 @@ from .history import HistoryStore
 from .ui_common import (
     NoFocusDelegate,
     StatusColors,
+    apply_theme,
     circle_avatar,
+    fit_style,
     hint_label,
     log_timestamp,
     make_app_icon,
+    make_tray_icon,
     nav_icon,
     plain_tip,
+    recolor_widgets,
     run_async,
 )
 from .ui_dialogs import LoginDialog, fetch_account, show_notice
@@ -87,7 +91,12 @@ COLUMNS = ["启用", "主播", "房间号", "状态", "弹幕内容", "间隔", 
 COL_ENABLED, COL_NAME, COL_ROOM, COL_STATUS, COL_MESSAGE, COL_INTERVAL, COL_SENT, COL_LAST = range(len(COLUMNS))
 
 SESSION_HINT = "只影响当前这一段（这场直播，或这次未开播期间），开播或下播后照常自动处理"
-WAIT_HINT = "开始监控（勾选、程序启动）时主播已经在播，或者未开播但设置了“未开播时也发送”：\n这一段点“本场开始发送”才发送，下次开播会自动发送"
+WAIT_HINT = (
+    "开始监控（勾选、程序启动）时主播已经在播，或者未开播但设置了“未开播时也发送”：\n"
+    "这一段点“本场开始发送”才发送，下次开播会自动发送\n"
+    "想让程序一打开就发送，可以在设置里勾选“开启软件后即开始发送弹幕”"
+)
+NOT_MONITORED_HINT = "请先启动直播间监控后重试。"  # 对没监控的直播间点“本场开始发送”“本场停止发送”时
 
 PAGE_ROOMS, PAGE_FAVORITES, PAGE_HISTORY, PAGE_SETTINGS = range(4)
 AVATAR_SIZE = 36
@@ -112,6 +121,7 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1000, 600)
 
         self.cfg = load_config()
+        apply_theme(self.cfg.theme)  # 先定好深色还是浅色，下面搭界面时用的颜色才对
         self.colors = StatusColors()
         self.favorites = FavoritesStore()
         self.history = HistoryStore()
@@ -131,6 +141,7 @@ class MainWindow(QMainWindow):
         self._log_entries: deque[tuple[str, str, str]] = deque(maxlen=LOG_LINES)  # (时间, 级别, 内容)
 
         self.engine = Engine(self.cfg.poll_interval_sec, history=self.history)
+        self.engine.set_send_on_startup(self.cfg.send_on_startup)  # 要在第一次 set_rooms 之前
         self.engine.room_changed.connect(self._on_room_changed)
         self.engine.log_message.connect(self._append_log)
         self.engine.notify.connect(self._notify)
@@ -140,6 +151,8 @@ class MainWindow(QMainWindow):
 
         self._build_ui()
         self.tray = self._build_tray() if use_tray and QSystemTrayIcon.isSystemTrayAvailable() else None
+        # 设置里换了外观，或者“跟随系统”时 Windows 换了深色 / 浅色
+        QGuiApplication.styleHints().colorSchemeChanged.connect(self._on_color_scheme_changed)
 
         self.engine.set_rooms(self.cfg.rooms)
         self._rebuild_table()
@@ -374,6 +387,7 @@ class MainWindow(QMainWindow):
             button.setIcon(nav_icon(icon))  # 图标在左，文字紧跟在图标右边
             button.setIconSize(QSize(NAV_ICON_SIZE, NAV_ICON_SIZE))
             button.setProperty("nav", True)
+            button.setProperty("navIcon", icon)  # 换深色 / 浅色时按这个重画图标
             button.setCheckable(True)
             button.setCursor(Qt.CursorShape.PointingHandCursor)
             self.nav_group.addButton(button, page)
@@ -429,7 +443,7 @@ class MainWindow(QMainWindow):
         return label
 
     def _build_tray(self) -> QSystemTrayIcon:
-        tray = QSystemTrayIcon(make_app_icon(), self)
+        tray = QSystemTrayIcon(make_tray_icon(), self)
         tray.setToolTip(APP_TITLE)
         menu = QMenu(self)
         show_action = QAction("显示主窗口", menu)
@@ -537,7 +551,8 @@ class MainWindow(QMainWindow):
     def _set_cell(self, row: int, column: int, text: str, color: str | None = None, bold: bool = False, tooltip: str = "") -> None:
         item = self._cell(row, column)
         item.setText(text)
-        item.setForeground(QColor(color) if color else self.table.palette().text())
+        # 没有指定颜色就不设，用表格当时的文字颜色，换深色 / 浅色时自动跟着变
+        item.setData(Qt.ItemDataRole.ForegroundRole, QColor(color) if color else None)
         font = item.font()
         font.setBold(bold)
         item.setFont(font)
@@ -782,7 +797,7 @@ class MainWindow(QMainWindow):
         not_live = [room for room in rooms if room.enabled and not self.engine.start_session(room.room_id)]
         if len(rooms) == 1 and not notify_only:
             if disabled:
-                QMessageBox.information(self, APP_TITLE, "这个直播间没有监控，先在“启用”那一列打勾。")
+                QMessageBox.information(self, APP_TITLE, NOT_MONITORED_HINT)
             elif not_live:
                 QMessageBox.information(
                     self,
@@ -806,7 +821,11 @@ class MainWindow(QMainWindow):
         if not rooms:
             return
         stopped = [room for room in rooms if self.engine.stop_session(room.room_id)]
-        if not stopped:
+        if stopped:
+            return
+        if not any(room.enabled for room in rooms):
+            QMessageBox.information(self, APP_TITLE, NOT_MONITORED_HINT)
+        else:
             QMessageBox.information(self, APP_TITLE, "选中的直播间现在都没有在发送。" if len(rooms) > 1 else "这个直播间现在没有在发送。")
 
     def _open_page(self, room_id: int) -> None:
@@ -1006,15 +1025,19 @@ class MainWindow(QMainWindow):
         self.poll_btn.setEnabled(not paused)  # 暂停时不检测，“立即检测”没有意义
         if self.tray:
             self.tray_pause_action.setText(label)
-            self.tray.setIcon(make_app_icon(paused))
+            self.tray.setIcon(make_tray_icon(paused))
         self._rebuild_table()
         self._update_monitor_label()
 
     def _save_settings(self) -> None:
         page = self.settings_page
+        old_theme = self.cfg.theme
         page.apply_to(self.cfg)
         self._save_config()
         self.engine.set_poll_interval(self.cfg.poll_interval_sec)
+        self.engine.set_send_on_startup(self.cfg.send_on_startup)
+        if self.cfg.theme != old_theme:
+            apply_theme(self.cfg.theme)  # 深色 / 浅色真的变了的话，会触发 _on_color_scheme_changed
         if page.autostart_checked() != system.is_autostart_enabled():
             try:
                 system.set_autostart(page.autostart_checked())
@@ -1029,6 +1052,24 @@ class MainWindow(QMainWindow):
             save_config(self.cfg)
         except OSError as e:
             self._log("error", f"保存配置失败：{e}")
+
+    def _on_color_scheme_changed(self, _scheme) -> None:
+        # 这个信号来的时候各控件还没换上新的调色板，等这一轮事件处理完再重新配色
+        QTimer.singleShot(0, self._apply_colors)
+
+    def _apply_colors(self) -> None:
+        """深色 / 浅色换了：样式表、图标、表格、日志都换成新的一套颜色。"""
+        fit_style()
+        old, self.colors = self.colors, StatusColors()
+        if old.values() == self.colors.values():
+            return
+        recolor_widgets(old, self.colors)
+        for button in self.nav_group.buttons():
+            button.setIcon(nav_icon(button.property("navIcon")))
+        self._rebuild_table()
+        self._render_log()
+        self._update_monitor_label()
+        self.history_page.apply_colors()
 
     def _log(self, level: str, text: str) -> None:
         """界面自己产生的日志：写进日志文件，并显示在日志面板。"""

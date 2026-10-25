@@ -145,5 +145,13 @@ assert cfg.rooms[1].interval_sec == 1
 assert config.MIN_SEND_INTERVAL == 1 and config.SUGGESTED_MIN_INTERVAL == 5
 print("最短间隔 OK")
 
+# ---- 外观：旧配置里没有就跟随系统，手改成不认识的值也拉回跟随系统
+assert config.AppConfig().theme == config.THEME_SYSTEM
+for value, expected in (("dark", config.THEME_DARK), ("light", config.THEME_LIGHT), ("紫色", config.THEME_SYSTEM)):
+    cfg = config.AppConfig(theme=value)
+    config._normalize(cfg)
+    assert cfg.theme == expected, (value, cfg.theme)
+print("外观 OK")
+
 shutil.rmtree(WORK, ignore_errors=True)
 print("全部通过")

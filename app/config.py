@@ -19,7 +19,7 @@ from pathlib import Path
 
 APP_ID = "BiliAutoDanmaku"  # 凭据管理器、开机启动项用这个名字，改了会丢登录，所以不跟着程序名改
 APP_TITLE = "B站弹幕自动化"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 
 # 发送间隔（秒）。B 站自己会拦“1 秒内发两条”，所以最短 1 秒；
 # 建议不短于 5 秒：发得太快容易被限流，也容易被房管禁言，设得更短时界面上会提醒。
@@ -68,6 +68,12 @@ CLOSE_ASK = "ask"
 CLOSE_TRAY = "tray"
 CLOSE_QUIT = "quit"
 CLOSE_CHOICES = {CLOSE_ASK: "每次询问", CLOSE_TRAY: "最小化到托盘", CLOSE_QUIT: "退出程序"}
+
+# 外观：跟着 Windows 的深色 / 浅色设置走，或者固定一种
+THEME_SYSTEM = "system"
+THEME_LIGHT = "light"
+THEME_DARK = "dark"
+THEME_CHOICES = {THEME_SYSTEM: "跟随系统", THEME_LIGHT: "白天模式", THEME_DARK: "黑夜模式"}
 
 log = logging.getLogger(__name__)
 
@@ -272,8 +278,11 @@ class AppConfig:
     rooms: list[RoomConfig] = field(default_factory=list)
     poll_interval_sec: int = DEFAULT_POLL_INTERVAL
     auto_monitor: bool = True  # 程序启动后自动开始检测；关掉的话启动时先处于“暂停监控”
+    # 程序打开时主播已经在播（或未开播但设置了“未开播时也发送”）的直播间直接开始发送，不用点“本场开始发送”
+    send_on_startup: bool = False
     browser: str = BROWSER_EDGE
     close_action: str = CLOSE_ASK
+    theme: str = THEME_SYSTEM
     notify: bool = True
     notice_shown: bool = False  # 第一次打开窗口时弹出的“使用须知”看过没有
     auto_check_update: bool = True  # 每天查一次 GitHub 上有没有新版本（见 update_check）
@@ -306,6 +315,8 @@ def _normalize(cfg: AppConfig) -> None:
         cfg.browser = BROWSER_EDGE
     if cfg.close_action not in CLOSE_CHOICES:
         cfg.close_action = CLOSE_ASK
+    if cfg.theme not in THEME_CHOICES:
+        cfg.theme = THEME_SYSTEM
     for room in cfg.rooms:
         if room.mode not in MODE_CHOICES:
             room.mode = MODE_REPEAT

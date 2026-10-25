@@ -1,9 +1,10 @@
-"""界面公用的小工具：图标、头像、二维码图片、状态颜色、常用控件、后台任务。"""
+"""界面公用的小工具：图标、头像、二维码图片、状态颜色和深色 / 浅色、常用控件、后台任务。"""
 
 from __future__ import annotations
 
 import html
 import math
+import re
 import time
 from collections.abc import Callable
 
@@ -23,6 +24,7 @@ from PySide6.QtGui import (
     QPolygonF,
 )
 from PySide6.QtWidgets import (
+    QApplication,
     QDialog,
     QDialogButtonBox,
     QHBoxLayout,
@@ -34,6 +36,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from shiboken6 import isValid
+
+from .config import THEME_DARK, THEME_LIGHT
 
 BILI_PINK = "#FB7299"
 PAUSED_GRAY = "#8C959F"
@@ -198,33 +202,142 @@ def save_cancel_buttons(dialog: QDialog, save_text: str = "保存") -> QDialogBu
     return buttons
 
 
-def make_app_icon(paused: bool = False) -> QIcon:
-    """程序图标：粉色圆角方块里一个“弹”字；暂停时变灰。"""
+# ---------------------------------------------------------------- 程序图标：对话气泡骑独轮车
+# “独轮车”是B站对反复刷同一句弹幕的叫法，也是本程序主要的发送方式。
+# 分三档画：48 像素以上带细节；20–32 像素去掉细节、线条加粗；托盘不要底板，暂停时变灰。
+
+APP_ICON_SIZES = (16, 20, 24, 32, 40, 48, 64, 128, 256)
+TRAY_ICON_SIZES = (16, 20, 24, 32, 40, 48)  # 托盘在 100%～300% 缩放下实际用到的大小
+LARGE_ICON_MIN = 48  # 从这么大开始用带细节的大图标
+SPEED_PINK = "#FFD3E0"  # 大图标左边的速度线
+
+
+def make_app_icon() -> QIcon:
+    """窗口、任务栏、通知和 exe 用的图标（托盘图标见 make_tray_icon）。"""
     icon = QIcon()
-    for size in (16, 20, 24, 32, 40, 48, 64, 128, 256):
-        pixmap = QPixmap(size, size)
-        pixmap.fill(Qt.GlobalColor.transparent)
-        painter = QPainter(pixmap)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(PAUSED_GRAY if paused else BILI_PINK))
-        radius = size * 0.22
-        painter.drawRoundedRect(QRectF(0, 0, size, size), radius, radius)
-        font = QFont("Microsoft YaHei UI")
-        font.setBold(True)
-        font.setPixelSize(max(8, round(size * 0.66)))
-        painter.setFont(font)
-        painter.setPen(QColor("white"))
-        painter.drawText(QRectF(0, 0, size, size), Qt.AlignmentFlag.AlignCenter, "弹")
-        painter.end()
-        icon.addPixmap(pixmap)
+    for size in APP_ICON_SIZES:
+        icon.addPixmap(app_icon_pixmap(size))
     return icon
+
+
+def app_icon_pixmap(size: int) -> QPixmap:
+    """正好 size×size 像素的程序图标。打包时生成 exe 图标也用它。"""
+    return _icon_pixmap(size, _draw_large_icon if size >= LARGE_ICON_MIN else _draw_small_icon)
+
+
+def make_tray_icon(paused: bool = False) -> QIcon:
+    """托盘图标：粉色的气泡和轮子，暂停监控时变灰。"""
+    color = PAUSED_GRAY if paused else BILI_PINK
+    icon = QIcon()
+    for size in TRAY_ICON_SIZES:
+        icon.addPixmap(_icon_pixmap(size, lambda painter: _draw_tray_icon(painter, color)))
+    return icon
+
+
+def _icon_pixmap(size: int, draw: Callable[[QPainter], None]) -> QPixmap:
+    pixmap = QPixmap(size, size)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+    painter.scale(size / 100, size / 100)  # 按 100×100 的格子画
+    draw(painter)
+    painter.end()
+    return pixmap
+
+
+def _draw_large_icon(painter: QPainter) -> None:
+    """车轮有辐条，左边有速度线，气泡里三个点。"""
+    _fill_backplate(painter)
+    for x, y in ((14, 60), (9, 70), (14, 80)):
+        _draw_line(painter, SPEED_PINK, 3.5, QPointF(x, y), QPointF(28, y))
+    _draw_ring(painter, "white", 6, QPointF(56, 70), 18)
+    for start, end in (((40, 70), (72, 70)), ((48, 56.1), (64, 83.9)), ((64, 56.1), (48, 83.9))):
+        _draw_line(painter, "white", 2.2, QPointF(*start), QPointF(*end), Qt.PenCapStyle.FlatCap)
+    _fill_circle(painter, "white", QPointF(56, 70), 3.5)
+    _draw_line(painter, "white", 5, QPointF(56, 46), QPointF(56, 68))
+    _fill_bubble(painter, "white", QRectF(33, 12, 46, 28), 10, 12, 7)
+    for x in (46, 56, 66):
+        _fill_circle(painter, BILI_PINK, QPointF(x, 26), 3.2)
+
+
+def _draw_small_icon(painter: QPainter) -> None:
+    """去掉辐条和速度线，线条加粗，缩小了也不糊。气泡里的三个点放大留着，不然气泡看着像块牌子。"""
+    _fill_backplate(painter)
+    _draw_ring(painter, "white", 11, QPointF(50, 71), 15)
+    _draw_line(painter, "white", 9, QPointF(50, 42), QPointF(50, 58), Qt.PenCapStyle.FlatCap)
+    _fill_bubble(painter, "white", QRectF(18, 8, 64, 32), 12, 16, 9)
+    for x in (34, 50, 66):
+        _fill_circle(painter, BILI_PINK, QPointF(x, 24), 6)
+
+
+def _draw_tray_icon(painter: QPainter, color: str) -> None:
+    """不要底板，和托盘里别的图标一样只有图形，深色、浅色任务栏上都看得清。"""
+    _fill_bubble(painter, color, QRectF(8, 4, 84, 38), 14, 20, 10)
+    for x in (32, 50, 68):
+        _fill_circle(painter, "white", QPointF(x, 23), 6)
+    _draw_line(painter, color, 10, QPointF(50, 50), QPointF(50, 60), Qt.PenCapStyle.FlatCap)
+    _draw_ring(painter, color, 12, QPointF(50, 76), 15)
+
+
+def _fill_backplate(painter: QPainter) -> None:
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor(BILI_PINK))
+    painter.drawRoundedRect(QRectF(0, 0, 100, 100), 22, 22)
+
+
+def _fill_bubble(painter: QPainter, color: str, body: QRectF, radius: float, tail_width: float, tail_height: float) -> None:
+    """对话气泡：圆角方块，底边中间一个朝下的尖。"""
+    path = QPainterPath()
+    path.addRoundedRect(body, radius, radius)
+    middle, bottom = body.center().x(), body.bottom()
+    tail = QPainterPath()
+    tail.addPolygon(QPolygonF([
+        QPointF(middle - tail_width / 2, bottom - 1), QPointF(middle, bottom + tail_height), QPointF(middle + tail_width / 2, bottom - 1)
+    ]))
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor(color))
+    painter.drawPath(path.united(tail))
+
+
+def _fill_circle(painter: QPainter, color: str, center: QPointF, radius: float) -> None:
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(QColor(color))
+    painter.drawEllipse(center, radius, radius)
+
+
+def _draw_ring(painter: QPainter, color: str, width: float, center: QPointF, radius: float) -> None:
+    pen = QPen(QColor(color))
+    pen.setWidthF(width)
+    painter.setPen(pen)
+    painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.drawEllipse(center, radius, radius)
+
+
+def _draw_line(painter: QPainter, color: str, width: float, start: QPointF, end: QPointF,
+               cap: Qt.PenCapStyle = Qt.PenCapStyle.RoundCap) -> None:
+    pen = QPen(QColor(color))
+    pen.setWidthF(width)
+    pen.setCapStyle(cap)
+    painter.setPen(pen)
+    painter.drawLine(start, end)
+
+
+HELP_ICON_SIZE = 16
 
 
 def help_icon(tip: str) -> QLabel:
     """圆圈里一个问号，鼠标停在上面显示说明。不常看的解释文字放这里，界面不占地方。"""
-    size, ratio = 16, 2
+    label = QLabel()
+    label.setPixmap(_help_pixmap())
+    label.setFixedSize(HELP_ICON_SIZE, HELP_ICON_SIZE)
+    label.setToolTip(tip)
+    label.setCursor(Qt.CursorShape.WhatsThisCursor)
+    label.setProperty("helpIcon", True)  # 换深色 / 浅色时 recolor_widgets 按这个找到它重画
+    return label
+
+
+def _help_pixmap() -> QPixmap:
+    size, ratio = HELP_ICON_SIZE, 2
     pixmap = QPixmap(size * ratio, size * ratio)
     pixmap.fill(Qt.GlobalColor.transparent)
     painter = QPainter(pixmap)
@@ -243,12 +356,7 @@ def help_icon(tip: str) -> QLabel:
     painter.drawText(full, Qt.AlignmentFlag.AlignCenter, "?")
     painter.end()
     pixmap.setDevicePixelRatio(ratio)
-    label = QLabel()
-    label.setPixmap(pixmap)
-    label.setFixedSize(size, size)
-    label.setToolTip(tip)
-    label.setCursor(Qt.CursorShape.WhatsThisCursor)
-    return label
+    return pixmap
 
 
 def with_help(widget: QWidget, tip: str) -> QHBoxLayout:
@@ -349,13 +457,92 @@ class StatusColors:
     """状态文字的颜色，深色模式下换成更亮的一套，保证看得清。"""
 
     def __init__(self) -> None:
-        dark = QGuiApplication.styleHints().colorScheme() == Qt.ColorScheme.Dark
-        if dark:
+        if is_dark():
             self.ok, self.warn, self.error, self.muted = "#3FB950", "#D29922", "#F85149", "#8B949E"
             self.selection, self.hover, self.sidebar = "#264F78", "#2D2D30", "#1B1B1C"
         else:
             self.ok, self.warn, self.error, self.muted = "#1A7F37", "#9A6700", "#CF222E", "#6E7781"
             self.selection, self.hover, self.sidebar = "#CCE8FF", "#E8E8EC", "#F3F3F5"
+
+    def values(self) -> tuple[str, ...]:
+        """全部颜色，顺序固定：换深色 / 浅色时两套颜色按位置一一对应。"""
+        return self.ok, self.warn, self.error, self.muted, self.selection, self.hover, self.sidebar
+
+
+# ---------------------------------------------------------------- 深色 / 浅色
+
+
+_THEME_SCHEMES = {THEME_LIGHT: Qt.ColorScheme.Light, THEME_DARK: Qt.ColorScheme.Dark}
+_native_style = ""  # Qt 一开始选的样式：Windows 11 是 windows11，Windows 10 是 windowsvista
+
+
+def is_dark() -> bool:
+    """界面现在是不是深色。看实际的窗口底色，不只看 Windows 的设置。"""
+    return QGuiApplication.palette().color(QPalette.ColorRole.Window).lightness() < 128
+
+
+def apply_theme(theme: str) -> None:
+    """外观设成跟随系统 / 白天模式 / 黑夜模式。Qt 当场换掉调色板；样式表里写死的颜色要再调 recolor_widgets。"""
+    QGuiApplication.styleHints().setColorScheme(_THEME_SCHEMES.get(theme, Qt.ColorScheme.Unknown))
+    fit_style()
+
+
+# Windows 10 深色时 Fusion 用的调色板。Windows 自己给的那套是配 windows11 样式的，Fusion 拿来画的话
+# 没勾选的勾选框是实心蓝块、表格隔行是深蓝色，所以自己配一套
+_FUSION_DARK = {
+    "Window": "#1E1E1E", "WindowText": "#FFFFFF", "Base": "#2D2D2D", "AlternateBase": "#262626",
+    "ToolTipBase": "#2D2D2D", "ToolTipText": "#FFFFFF", "PlaceholderText": "#9D9D9D", "Text": "#FFFFFF",
+    "Button": "#3C3C3C", "ButtonText": "#FFFFFF", "BrightText": "#FF5555", "Light": "#5A5A5A", "Midlight": "#4A4A4A",
+    "Mid": "#3A3A3A", "Dark": "#141414", "Shadow": "#000000", "Highlight": "#0078D4", "HighlightedText": "#FFFFFF",
+    "Link": "#4CC2FF", "LinkVisited": "#B58AFF", "Accent": "#0078D4",
+}
+_PALETTE_CLASSES = ("QCheckBox", "QRadioButton")  # Windows 给这两种控件单独配了调色板，要一起换掉
+
+
+def _fusion_dark_palette() -> QPalette:
+    palette = QPalette()
+    for role, color in _FUSION_DARK.items():
+        palette.setColor(getattr(QPalette.ColorRole, role), QColor(color))
+    for role in (QPalette.ColorRole.WindowText, QPalette.ColorRole.Text, QPalette.ColorRole.ButtonText):
+        palette.setColor(QPalette.ColorGroup.Disabled, role, QColor("#7A7A7A"))
+    return palette
+
+
+def fit_style() -> None:
+    """Windows 10 默认的 windowsvista 样式画不出深色界面：要深色时改用 Fusion 和上面那套调色板，浅色时换回来。"""
+    global _native_style
+    app = QApplication.instance()
+    _native_style = _native_style or app.style().name()
+    if _native_style != "windowsvista":
+        return
+    dark = QGuiApplication.styleHints().colorScheme() == Qt.ColorScheme.Dark
+    if dark == (app.style().name() == "fusion"):
+        return
+    app.setStyle("fusion" if dark else _native_style)
+    palette = _fusion_dark_palette() if dark else QPalette()  # 空的调色板＝换回 Windows 给的
+    app.setPalette(palette)
+    for name in _PALETTE_CLASSES:
+        app.setPalette(palette, name)
+
+
+def recolor_widgets(old: StatusColors, new: StatusColors) -> None:
+    """换了深色 / 浅色：各窗口样式表里写死的旧颜色（提示文字、状态文字、选中行、标签卡片等）换成新的，问号图标重画。
+
+    表格、日志这些按颜色画出来的内容不归这里管，由各页面自己重画。
+    """
+    mapping = {a.upper(): b for a, b in zip(old.values(), new.values()) if a.upper() != b.upper()}
+    if not mapping:
+        return
+    pattern = re.compile("|".join(re.escape(color) for color in mapping), re.IGNORECASE)
+    for top in QApplication.topLevelWidgets():
+        for widget in (top, *top.findChildren(QWidget)):
+            sheet = widget.styleSheet()
+            if sheet:
+                recolored = pattern.sub(lambda m: mapping[m.group(0).upper()], sheet)
+                if recolored != sheet:
+                    widget.setStyleSheet(recolored)
+            if widget.property("helpIcon"):
+                widget.setPixmap(_help_pixmap())
 
 
 # ---------------------------------------------------------------- 后台任务

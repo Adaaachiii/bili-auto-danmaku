@@ -250,6 +250,11 @@ class HistoryPage(QWidget):
         if self.isVisible():
             self.refresh()
 
+    def apply_colors(self) -> None:
+        """深色 / 浅色换了：用新颜色重画（没打开这一页的话，下次打开时再画）。"""
+        self.colors = StatusColors()
+        self.refresh_if_visible()
+
     def _on_range_changed(self, _index: int = 0, redraw: bool = True) -> None:
         custom = self.range_combo.currentData() == "custom"
         for widget in (self.from_edit, self.to_label, self.to_edit):

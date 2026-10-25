@@ -48,7 +48,8 @@ class Session(Enum):
     IDLE = "idle"  # 不发送（未开播，且没设置“未开播时也发送”）
     SENDING = "sending"  # 正在按间隔发送
     # 开始监控（勾选、程序启动、改设置）时主播已经在播，或者未开播但设置了“未开播时也发送”：
-    # 这一段不自动发，点“本场开始发送”才发；下次开播照常自动发送
+    # 这一段不自动发，点“本场开始发送”才发；下次开播照常自动发送。
+    # 例外：设置里勾了“开启软件后即开始发送弹幕”时，程序启动时的那一段直接发
     WAIT_NEXT = "wait_next"
     STOPPED = "stopped"  # 本场已停发（手动停，或连续失败）
     MUTED = "muted"  # 本场被禁言
@@ -112,6 +113,7 @@ class _RoomState:
     record_gen: int = 0  # 那条记录属于第几轮
     first_send_at: float | None = None  # 这一轮发出第一条的时间，“每场最多发多少分钟”从这里算
     repeat_index: int = -1  # 独轮车上一条发的是第几项（见 RoomConfig.repeat_items）
+    startup: bool = False  # 程序打开时就在监控、还没检测出结果：按“开启软件后即开始发送弹幕”处理
 
     @property
     def name(self) -> str:
@@ -127,6 +129,7 @@ class _RoomState:
         self.offline_streak = 0
         self.session = Session.IDLE
         self.error = ""
+        self.startup = False  # 之后再勾上算“勾选”，不算程序启动
 
     def begin_session(self, new_live: bool = False) -> None:
         """开始发送。new_live 表示这是新的一场直播：没开“说书状态继承”时，说书从头开始。"""
@@ -179,6 +182,8 @@ class Engine(QObject):
         self._rooms: dict[int, _RoomState] = {}
         self._poll_interval = poll_interval
         self._creds: Credentials | None = None
+        self._send_on_startup = False  # 设置里的“开启软件后即开始发送弹幕”
+        self._rooms_loaded = False  # 第一次 set_rooms 给的是程序打开时的直播间
         self._paused = False
         self._poll_requested = True
         self._next_poll_at = 0.0
@@ -218,7 +223,7 @@ class Engine(QObject):
                 cfg = replace(cfg)  # 复制一份，界面那边再改也不影响引擎
                 state = self._rooms.get(cfg.room_id)
                 if state is None:
-                    state = _RoomState(cfg=cfg)
+                    state = _RoomState(cfg=cfg, startup=not self._rooms_loaded and cfg.enabled)
                     self._poll_requested = True
                 else:
                     was_enabled = state.cfg.enabled
@@ -255,8 +260,13 @@ class Engine(QObject):
                 if room_id not in updated and state.record_id is not None:
                     self._close_record(state, time.time(), events, "删除了直播间")
             self._rooms = updated
+            self._rooms_loaded = True
         self._dispatch(events)
         self._wake_all()
+
+    def set_send_on_startup(self, enabled: bool) -> None:
+        with self._lock:
+            self._send_on_startup = enabled
 
     def set_poll_interval(self, seconds: int) -> None:
         with self._lock:
@@ -462,13 +472,19 @@ class Engine(QObject):
                 events.append(("log", "info", f"[{name}] 开播状态检测已恢复"))
             state.live_status = live_status
             previous = state.live
+            # 程序打开后第一次检测出结果，并且设置了“开启软件后即开始发送弹幕”：这一段不等手动开始
+            send_now = state.startup and self._send_on_startup
+            state.startup = False
 
             if not state.cfg.sends:
                 self._apply_notify_only(state, live_status, previous, events)
             elif live_status == bili_api.LIVE_ON:
                 state.offline_streak = 0
                 state.live = True
-                if previous is None:  # 刚开始监控（勾选、程序启动）时主播已经在播：只监控，等手动开始
+                if previous is None and send_now:  # 程序打开时主播已经在播，按设置直接发
+                    state.begin_session()
+                    events.append(("log", "info", f"[{name}] 正在直播，按设置开启软件后即开始发送弹幕{self._story_hint(state)}"))
+                elif previous is None:  # 刚开始监控（勾选、程序启动）时主播已经在播：只监控，等手动开始
                     state.session = Session.WAIT_NEXT
                     events.append(("log", "info", f"[{name}] 正在直播。这一场点“本场开始发送”才发送，下次开播会自动发送"))
                 elif previous is False:  # 开播
@@ -496,7 +512,10 @@ class Engine(QObject):
                         events.append(("notify", f"{name} 下播了", f"已停止发送，本场共发 {count} 条"))
             elif previous is None:  # 刚开始监控时主播没在播
                 state.live = False
-                if state.cfg.send_when_offline:
+                if state.cfg.send_when_offline and send_now:
+                    state.begin_session()
+                    events.append(("log", "info", f"[{name}] 当前未开播，按设置开启软件后即开始发送弹幕{self._story_hint(state)}"))
+                elif state.cfg.send_when_offline:
                     state.session = Session.WAIT_NEXT
                     events.append(("log", "info", f"[{name}] 当前未开播。未开播时的发送点“本场开始发送”才开始，开播后会自动发送"))
                 else:

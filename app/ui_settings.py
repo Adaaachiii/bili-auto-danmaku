@@ -25,6 +25,7 @@ from .config import (
     CLOSE_CHOICES,
     MAX_POLL_INTERVAL,
     MIN_POLL_INTERVAL,
+    THEME_CHOICES,
     AppConfig,
     data_dir,
 )
@@ -58,8 +59,15 @@ class SettingsPage(QWidget):
         self.poll_spin.setRange(MIN_POLL_INTERVAL, MAX_POLL_INTERVAL)
         self.poll_spin.setFixedWidth(100)
         self.auto_monitor_check = QCheckBox("程序启动后自动检测直播间状态")
+        self.send_on_startup_check = QCheckBox("开启软件后即开始发送弹幕")
         self.browser_combo = _combo(BROWSER_CHOICES)
         self.close_combo = _combo(CLOSE_CHOICES)
+        self.theme_combo = _combo(THEME_CHOICES)
+        # 下拉框只要放得下最长的选项就行，不铺满整行；几个一样宽，看着整齐
+        combos = (self.browser_combo, self.close_combo, self.theme_combo)
+        width = max(combo.sizeHint().width() for combo in combos)
+        for combo in combos:
+            combo.setFixedWidth(width)
         self.notify_check = QCheckBox("开播、下播或发送出错时弹出系统通知")
         self.autostart_check = QCheckBox("开机自动启动（启动后直接缩小到托盘）")
         self.auto_update_check = QCheckBox("自动检查更新")
@@ -73,17 +81,19 @@ class SettingsPage(QWidget):
         auto_hint = hint_label("关闭后，程序启动时先暂停监控，点“继续监控”才开始检测和发送")
         auto_hint.setWordWrap(False)
         form.addRow("", auto_hint)
+        form.addRow("", self.send_on_startup_check)
+        startup_hint = hint_label("程序打开时主播已经在播的直播间直接开始发送，不用点“本场开始发送”")
+        startup_hint.setWordWrap(False)
+        form.addRow("", startup_hint)
         form.addRow("打开直播页用：", self.browser_combo)
         form.addRow("关闭窗口时：", self.close_combo)
+        form.addRow("外观：", self.theme_combo)
         form.addRow("", self.notify_check)
         notify_hint = hint_label("“只提醒”的直播间不受这个开关影响，开播、下播总会提醒")
         notify_hint.setWordWrap(False)
         form.addRow("", notify_hint)
         form.addRow("", self.autostart_check)
         form.addRow("", self.auto_update_check)
-        update_hint = hint_label("每天查一次 GitHub 上有没有新版本，GitHub 只看得到你的 IP 和程序版本号")
-        update_hint.setWordWrap(False)
-        form.addRow("", update_hint)
 
         folder = str(data_dir())
         folder_label = hint_label(f"配置、收藏夹和日志保存在：{folder}")
@@ -113,9 +123,11 @@ class SettingsPage(QWidget):
         self._saved_timer.setInterval(2500)
         self._saved_timer.timeout.connect(self.saved_label.clear)
         save_row = QHBoxLayout()
+        save_row.setContentsMargins(0, 8, 0, 0)
         save_row.addWidget(self.save_btn)
         save_row.addWidget(self.saved_label)
         save_row.addStretch(1)
+        form.addRow("", save_row)  # 放进表单，和上面的勾选框左边对齐
 
         content = QWidget()
         content.setMaximumWidth(720)
@@ -123,7 +135,6 @@ class SettingsPage(QWidget):
         box.setContentsMargins(0, 0, 0, 0)
         box.setSpacing(12)
         box.addLayout(form)
-        box.addLayout(save_row)
         box.addSpacing(12)
         box.addLayout(folder_row)
         box.addLayout(backup_row)
@@ -170,8 +181,10 @@ class SettingsPage(QWidget):
     def load(self, cfg: AppConfig, autostart: bool) -> None:
         self.poll_spin.setValue(cfg.poll_interval_sec)
         self.auto_monitor_check.setChecked(cfg.auto_monitor)
+        self.send_on_startup_check.setChecked(cfg.send_on_startup)
         self.browser_combo.setCurrentIndex(self.browser_combo.findData(cfg.browser))
         self.close_combo.setCurrentIndex(self.close_combo.findData(cfg.close_action))
+        self.theme_combo.setCurrentIndex(self.theme_combo.findData(cfg.theme))
         self.notify_check.setChecked(cfg.notify)
         self.autostart_check.setChecked(autostart)
         self.auto_update_check.setChecked(cfg.auto_check_update)
@@ -180,8 +193,10 @@ class SettingsPage(QWidget):
     def apply_to(self, cfg: AppConfig) -> None:
         cfg.poll_interval_sec = self.poll_spin.value()
         cfg.auto_monitor = self.auto_monitor_check.isChecked()
+        cfg.send_on_startup = self.send_on_startup_check.isChecked()
         cfg.browser = self.browser_combo.currentData()
         cfg.close_action = self.close_combo.currentData()
+        cfg.theme = self.theme_combo.currentData()
         cfg.notify = self.notify_check.isChecked()
         cfg.auto_check_update = self.auto_update_check.isChecked()
 

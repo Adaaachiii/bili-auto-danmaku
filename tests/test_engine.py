@@ -1,4 +1,5 @@
-"""监控逻辑测试：开播 / 下播的判断、未开播时也发送、手动开始 / 停止、开始监控时已在播要手动开始。
+"""监控逻辑测试：开播 / 下播的判断、未开播时也发送、手动开始 / 停止、开始监控时已在播要手动开始，
+以及“开启软件后即开始发送弹幕”（程序打开时那一次直接发）。
 
 运行：python tests/test_engine.py（不联网，B 站接口都换成假的）。
 """
@@ -99,5 +100,35 @@ e, room = make(send_when_offline=True)
 e._apply_status(1, ON, "", ""); assert session(e) is Session.WAIT_NEXT and send_now(e) == 0
 e._apply_status(1, OFF, "", ""); e._apply_status(1, OFF, "", ""); assert session(e) is Session.SENDING and send_now(e) == 1
 print("F 下播后接着发 OK")
+
+
+# G. 开启软件后即开始发送弹幕：程序打开时就在监控的直播间，第一次检测出结果就直接发；之后勾选、新加的照旧等手动开始
+def make_startup(**room_kw):
+    e = Engine(30)
+    e.set_send_on_startup(True)  # 主窗口也是在第一次 set_rooms 之前设
+    e.set_credentials(bili_api.Credentials("x", "y"))
+    room = RoomConfig(room_id=1, uid=1, message="hi", interval_sec=5, **room_kw)
+    e.set_rooms([room])
+    return e, room
+
+
+e, room = make_startup()
+e._apply_status(1, ON, "", ""); assert session(e) is Session.SENDING and send_now(e) == 1
+e.set_rooms([replace(room, enabled=False)]); e.set_rooms([room])  # 直播中取消监控再勾上：算勾选，不算程序启动
+e._apply_status(1, ON, "", ""); assert session(e) is Session.WAIT_NEXT and send_now(e) == 0
+room2 = RoomConfig(room_id=2, uid=2, message="hi", interval_sec=5)  # 程序打开后才加的直播间
+e.set_rooms([room, room2]); e._apply_status(2, ON, "", ""); assert e.view(2).session is Session.WAIT_NEXT
+e, room = make_startup(enabled=False)  # 程序打开时没勾监控，后来才勾上
+e.set_rooms([replace(room, enabled=True)]); e._apply_status(1, ON, "", ""); assert session(e) is Session.WAIT_NEXT
+e, room = make_startup(send_when_offline=True)  # 未开播时也发送：打开时未开播也直接发
+e._apply_status(1, OFF, "", ""); assert session(e) is Session.SENDING and send_now(e) == 1
+e, room = make_startup()  # 打开时未开播、没设未开播也发：等开播，开播照常自动发
+e._apply_status(1, OFF, "", ""); assert session(e) is Session.IDLE
+e._apply_status(1, ON, "", ""); assert session(e) is Session.SENDING
+e, room = make_startup()  # 第一次检测失败（比如还没联网），下一次才查到在播：还算程序启动
+e._apply_error(1, "网络错误"); e._apply_status(1, ON, "", ""); assert session(e) is Session.SENDING
+e, room = make()  # 没勾这个选项：和以前一样等手动开始（B 里也测过）
+e._apply_status(1, ON, "", ""); assert session(e) is Session.WAIT_NEXT
+print("G 开启软件后即开始发送 OK")
 shutil.rmtree(HOME, ignore_errors=True)
 print("全部通过")
