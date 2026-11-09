@@ -11,14 +11,16 @@ import html
 import os
 import time
 from collections import Counter
+from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 
-from PySide6.QtCore import QDate, Qt, QTimer
+from PySide6.QtCore import QAbstractTableModel, QDate, QModelIndex, Qt, QTimer
 from PySide6.QtGui import QColor, QGuiApplication
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
     QDateEdit,
+    QFrame,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -26,6 +28,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QSplitter,
+    QTableView,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
@@ -34,8 +37,27 @@ from PySide6.QtWidgets import (
 )
 
 from .config import MODE_STORY
-from .history import FILTERED_CSV_NAME, HistoryStore, SessionRecord, StatRow, stats_by_day, stats_by_room, total_stats
-from .ui_common import NoFocusDelegate, StatusColors, format_duration, hint_label, plain_tip, utc_offset_label
+from .history import (
+    FILTERED_CSV_NAME,
+    FailureRecord,
+    HistoryStore,
+    SessionRecord,
+    StatRow,
+    stats_by_day,
+    stats_by_room,
+    total_stats,
+)
+from .ui_common import (
+    NoFocusDelegate,
+    StatusColors,
+    card_frame,
+    flat_tabs_style,
+    format_duration,
+    help_icon,
+    hint_label,
+    plain_tip,
+    utc_offset_label,
+)
 
 REFRESH_MS = 5000  # 页面开着时，进行中的记录每隔这么久刷新一次
 
@@ -55,9 +77,7 @@ def _rate_text(row: StatRow) -> str:
     return "—" if row.success_rate is None else f"{row.success_rate:.1%}"
 
 
-def _table(columns: list[str], multi: bool = False) -> QTableWidget:
-    table = QTableWidget(0, len(columns))
-    table.setHorizontalHeaderLabels(columns)
+def _setup_table(table: QTableView, multi: bool = False) -> None:
     table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
     table.setSelectionMode(
         QAbstractItemView.SelectionMode.ExtendedSelection if multi else QAbstractItemView.SelectionMode.SingleSelection
@@ -69,7 +89,70 @@ def _table(columns: list[str], multi: bool = False) -> QTableWidget:
     table.verticalHeader().setVisible(False)
     table.verticalHeader().setDefaultSectionSize(30)
     table.setItemDelegate(NoFocusDelegate(table))
+
+
+def _table(columns: list[str], multi: bool = False) -> QTableWidget:
+    table = QTableWidget(0, len(columns))
+    table.setHorizontalHeaderLabels(columns)
+    _setup_table(table, multi)
     return table
+
+
+@contextmanager
+def _bulk_update(table: QTableWidget):
+    """一次填很多格时，先别让“按内容定列宽”的列跟着每一格重算。
+
+    表格开着的时候，每填一格 Qt 都会把这些列从头到尾重新量一遍：几十行的表填一次要好几秒，
+    历史记录页每 5 秒刷新一次就一直卡、CPU 也一直占着。填完再换回来，只量一次。
+    """
+    header = table.horizontalHeader()
+    modes = [header.sectionResizeMode(column) for column in range(table.columnCount())]
+    for column, mode in enumerate(modes):
+        if mode == QHeaderView.ResizeMode.ResizeToContents:
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Fixed)
+    try:
+        yield
+    finally:
+        for column, mode in enumerate(modes):
+            header.setSectionResizeMode(column, mode)
+
+
+class FailureModel(QAbstractTableModel):
+    """一场的失败弹幕。一场可能有上万条，用模型按需取数，不给每一格都建一个表格项。"""
+
+    def __init__(self, columns: list[str], parent=None):
+        super().__init__(parent)
+        self._columns = columns
+        self._rows: list[FailureRecord] = []
+
+    def set_rows(self, rows: list[FailureRecord]) -> None:
+        self.beginResetModel()
+        self._rows = rows
+        self.endResetModel()
+
+    def text(self, row: int) -> str:
+        return self._rows[row].text
+
+    def rowCount(self, parent=QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self._rows)
+
+    def columnCount(self, parent=QModelIndex()) -> int:
+        return 0 if parent.isValid() else len(self._columns)
+
+    def data(self, index, role=Qt.ItemDataRole.DisplayRole):
+        if not index.isValid():
+            return None
+        failure = self._rows[index.row()]
+        if role == Qt.ItemDataRole.DisplayRole:
+            return (_time_text(failure.at, "%m-%d %H:%M:%S"), failure.reason, failure.text)[index.column()]
+        if role == Qt.ItemDataRole.ToolTipRole and index.column() == 2:
+            return plain_tip(failure.text)
+        return None
+
+    def headerData(self, section, orientation, role=Qt.ItemDataRole.DisplayRole):
+        if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
+            return self._columns[section]
+        return None
 
 
 def _stat_table(first_column: str) -> QTableWidget:
@@ -99,6 +182,8 @@ class HistoryPage(QWidget):
         self.store = store
         self.colors = StatusColors()
         self._records: list[SessionRecord] = []
+        self._detail_key: tuple | None = None  # 下面失败列表现在显示的是哪一场的什么状态，没变就不重新读
+        self._detail_reasons = ""
 
         title = QLabel("历史记录")
         title.setStyleSheet("font-size: 11pt; font-weight: bold;")
@@ -109,10 +194,10 @@ class HistoryPage(QWidget):
         self.delete_btn.clicked.connect(self._delete)
         bar = QHBoxLayout()
         bar.addWidget(title)
-        bar.addSpacing(8)
+        bar.addWidget(help_icon("每次从开始发弹幕到停止发弹幕记一条，发送不到 5 分钟的不保存；按开始时间筛选"))
+        bar.addStretch(1)
         bar.addWidget(self.csv_btn)
         bar.addWidget(self.delete_btn)
-        bar.addStretch(1)
 
         # ---- 筛选：直播间、时间范围（两页共用）
         self.room_combo = QComboBox()
@@ -131,19 +216,37 @@ class HistoryPage(QWidget):
             edit.dateChanged.connect(lambda _date: self.refresh())
         self.to_label = QLabel("到")
         filter_row = QHBoxLayout()
-        filter_row.addWidget(QLabel("直播间："))
-        filter_row.addWidget(self.room_combo)
-        filter_row.addSpacing(12)
-        filter_row.addWidget(QLabel("时间："))
-        filter_row.addWidget(self.range_combo)
+        for text in ("直播间", "时间"):
+            label = hint_label(text)
+            label.setWordWrap(False)
+            if text == "时间":
+                filter_row.addSpacing(12)
+            filter_row.addWidget(label)
+            filter_row.addWidget(self.room_combo if text == "直播间" else self.range_combo)
         filter_row.addWidget(self.from_edit)
         filter_row.addWidget(self.to_label)
         filter_row.addWidget(self.to_edit)
-        filter_row.addSpacing(12)
-        filter_row.addWidget(hint_label("每次从开始发弹幕到停止发弹幕记一条，发送不到 5 分钟的不保存；按开始时间筛选"), 1)
+        filter_row.addStretch(1)
         self._on_range_changed(redraw=False)
 
+        # ---- 汇总：筛选范围里一共多少场、成功多少、失败多少、成功率
+        self._cards: dict[str, QLabel] = {}
+        cards_row = QHBoxLayout()
+        cards_row.setSpacing(10)
+        for key, caption in (("sessions", "场次"), ("ok", "发送成功"), ("failed", "发送失败"), ("rate", "成功率")):
+            caption_label = hint_label(caption)
+            caption_label.setWordWrap(False)
+            value = QLabel("—")
+            value.setStyleSheet("font-size: 15pt; font-weight: bold;")
+            self._cards[key] = value
+            column = QVBoxLayout()
+            column.setSpacing(0)
+            column.addWidget(caption_label)
+            column.addWidget(value)
+            cards_row.addWidget(card_frame(column), 1)
+
         self.tabs = QTabWidget()
+        self.tabs.setStyleSheet(flat_tabs_style())
         self.tabs.addTab(self._build_records_tab(), "记录")
         self.tabs.addTab(self._build_stats_tab(), "统计")
         self.tabs.currentChanged.connect(lambda _index: self.refresh())
@@ -153,6 +256,7 @@ class HistoryPage(QWidget):
         layout.setSpacing(10)
         layout.addLayout(bar)
         layout.addLayout(filter_row)
+        layout.addLayout(cards_row)
         layout.addWidget(self.tabs, 1)
 
         self._timer = QTimer(self)
@@ -171,11 +275,12 @@ class HistoryPage(QWidget):
         self.summary = QLabel()
         self.summary.setWordWrap(True)
         self.summary.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.failures = _table(self.FAILURE_COLUMNS, multi=True)
+        self.failure_model = FailureModel(self.FAILURE_COLUMNS, self)
+        self.failures = QTableView()
+        _setup_table(self.failures, multi=True)
+        self.failures.setModel(self.failure_model)
         header = self.failures.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)  # 前两列的宽度在 _fit_failure_columns 里算
         self.failures.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.failures.customContextMenuRequested.connect(self._failure_menu)
 
@@ -284,6 +389,15 @@ class HistoryPage(QWidget):
         room_id = self.room_combo.currentData()
         start, end = self.time_range()
         self._records = self.store.sessions(room_id, start, end)
+        sent = sum(record.sent for record in self._records)
+        ok = sum(record.ok for record in self._records)
+        self._cards["sessions"].setText(f"{len(self._records):,}")
+        self._cards["ok"].setText(f"{ok:,}")
+        self._cards["failed"].setText(f"{sent - ok:,}")
+        self._cards["failed"].setStyleSheet(
+            "font-size: 15pt; font-weight: bold;" + (f" color: {self.colors.error};" if sent - ok else "")
+        )
+        self._cards["rate"].setText(f"{ok / sent:.1%}" if sent else "—")
         if self.tabs.currentIndex() == 0:
             self._fill_records()
         else:
@@ -294,6 +408,16 @@ class HistoryPage(QWidget):
         now = time.time()
         table = self.sessions
         table.blockSignals(True)
+        with _bulk_update(table):
+            self._fill_session_rows(table, now)
+        table.clearSelection()
+        for row, record in enumerate(self._records):
+            if record.id in selected:
+                table.selectRow(row)
+        table.blockSignals(False)
+        self._show_detail()
+
+    def _fill_session_rows(self, table: QTableWidget, now: float) -> None:
         table.setRowCount(len(self._records))
         for row, record in enumerate(self._records):
             story_mode = record.mode == MODE_STORY
@@ -317,12 +441,6 @@ class HistoryPage(QWidget):
             for column, cell in enumerate(cells):
                 cell.setData(Qt.ItemDataRole.UserRole, record.id)
                 table.setItem(row, column, cell)
-        table.clearSelection()
-        for row, record in enumerate(self._records):
-            if record.id in selected:
-                table.selectRow(row)
-        table.blockSignals(False)
-        self._show_detail()
 
     def _fill_stats(self, room_id: int | None, start: float | None, end: float | None) -> None:
         now = time.time()
@@ -341,13 +459,18 @@ class HistoryPage(QWidget):
 
         reasons = self.store.failure_breakdown(room_id, start, end)
         failed = sum(count for _, count in reasons)
-        self.reason_stats.setRowCount(len(reasons))
-        for row, (category, count) in enumerate(reasons):
-            self.reason_stats.setItem(row, 0, _item(category))
-            self.reason_stats.setItem(row, 1, _item(f"{count:,}", align_right=True))
-            self.reason_stats.setItem(row, 2, _item(f"{count / failed:.1%}", align_right=True))
+        with _bulk_update(self.reason_stats):
+            self.reason_stats.setRowCount(len(reasons))
+            for row, (category, count) in enumerate(reasons):
+                self.reason_stats.setItem(row, 0, _item(category))
+                self.reason_stats.setItem(row, 1, _item(f"{count:,}", align_right=True))
+                self.reason_stats.setItem(row, 2, _item(f"{count / failed:.1%}", align_right=True))
 
     def _fill_stat_table(self, table: QTableWidget, rows: list[StatRow], tips: bool = False) -> None:
+        with _bulk_update(table):
+            self._fill_stat_rows(table, rows, tips)
+
+    def _fill_stat_rows(self, table: QTableWidget, rows: list[StatRow], tips: bool) -> None:
         table.setRowCount(len(rows))
         for index, row in enumerate(rows):
             cells = [
@@ -389,33 +512,49 @@ class HistoryPage(QWidget):
     def _show_detail(self) -> None:
         ids = self._selected_ids()
         self.delete_btn.setEnabled(any(not r.ongoing for r in self._records if r.id in ids))
-        self.failures.setRowCount(0)
-        if not self._records:
-            self.summary.setText("这个范围里没有记录。发送超过 5 分钟后，停止发送时会在这里记一条。")
-            return
-        if len(ids) != 1:
-            self.summary.setText("选中一条记录，这里会列出那次所有失败的弹幕。" if not ids else f"选中了 {len(ids)} 条记录。")
-            return
-        record = next((r for r in self._records if r.id == ids[0]), None)
+        record = next((r for r in self._records if r.id == ids[0]), None) if len(ids) == 1 else None
         if record is None:
+            self._show_failures(None)
+            if not self._records:
+                self.summary.setText("这个范围里没有记录。发送超过 5 分钟后，停止发送时会在这里记一条。")
+            elif len(ids) != 1:
+                self.summary.setText("选中一条记录，这里会列出那次所有失败的弹幕。" if not ids else f"选中了 {len(ids)} 条记录。")
             return
-        failures = self.store.failures(record.id)
-        reasons = Counter(f.category for f in failures)
-        reason_text = "，".join(f"{category} {n} 条" for category, n in reasons.most_common())
+        self._show_failures(record)
         end = "还在发送" if record.ongoing else f"{_time_text(record.ended_at, '%Y-%m-%d %H:%M:%S')}（{record.end_reason}）"
         # 这里用了 HTML（加粗、换行），主播昵称和失败原因要转义，不能当成 HTML
-        end, reason_text = html.escape(end), html.escape(reason_text)
+        end, reason_text = html.escape(end), html.escape(self._detail_reasons)
         self.summary.setText(
             f"<b>{html.escape(record.uname)}</b>（房间 {record.room_id}）　"
             f"{_time_text(record.started_at, '%Y-%m-%d %H:%M:%S')} 开始，{end}，共 {format_duration(record.duration())}<br>"
             f"发送 {record.sent} 条，成功 {record.ok} 条，失败 {record.failed} 条"
             + (f"：{reason_text}" if reason_text else "")
         )
-        self.failures.setRowCount(len(failures))
-        for row, failure in enumerate(failures):
-            self.failures.setItem(row, 0, _item(_time_text(failure.at, "%m-%d %H:%M:%S")))
-            self.failures.setItem(row, 1, _item(failure.reason))
-            self.failures.setItem(row, 2, _item(failure.text, tip=failure.text))
+
+    def _show_failures(self, record: SessionRecord | None) -> None:
+        """下面的失败列表换成这一场的。定时刷新时这一场没有新的失败就不重新读（一场可能有上万条）。"""
+        key = None if record is None else (record.id, record.failed)
+        if key == self._detail_key:
+            return
+        self._detail_key = key
+        failures = [] if record is None else self.store.failures(record.id)
+        reasons = Counter(f.category for f in failures)
+        self._detail_reasons = "，".join(f"{category} {n} 条" for category, n in reasons.most_common())
+        self.failure_model.set_rows(failures)
+        self._fit_failure_columns(failures)
+
+    def _fit_failure_columns(self, failures: list[FailureRecord]) -> None:
+        """时间、失败原因两列按内容定宽。不用“按内容自动定宽”：上万行时那样每次都要逐行量。"""
+        header = self.failures.horizontalHeader()
+        cell, title = self.failures.fontMetrics(), header.fontMetrics()
+        padding = 24
+        widths = [
+            max(cell.horizontalAdvance("00-00 00:00:00"), title.horizontalAdvance(self.FAILURE_COLUMNS[0])),
+            max([cell.horizontalAdvance(reason) for reason in {f.reason for f in failures}]
+                + [title.horizontalAdvance(self.FAILURE_COLUMNS[1])]),
+        ]
+        for column, width in enumerate(widths):
+            header.resizeSection(column, min(width + padding, 420))
 
     def _failure_menu(self, pos) -> None:
         rows = sorted({index.row() for index in self.failures.selectionModel().selectedRows()})
@@ -424,7 +563,7 @@ class HistoryPage(QWidget):
         menu = QMenu(self)
         copy = menu.addAction(f"复制选中的 {len(rows)} 条弹幕" if len(rows) > 1 else "复制这条弹幕")
         if menu.exec(self.failures.viewport().mapToGlobal(pos)) is copy:
-            QGuiApplication.clipboard().setText("\n".join(self.failures.item(row, 2).text() for row in rows))
+            QGuiApplication.clipboard().setText("\n".join(self.failure_model.text(row) for row in rows))
 
     # ------------------------------------------------------------ 按钮
 

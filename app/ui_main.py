@@ -12,8 +12,8 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-from PySide6.QtCore import QLibraryInfo, QLocale, QPoint, QSize, Qt, QTimer, QTranslator
-from PySide6.QtGui import QAction, QColor, QFont, QGuiApplication, QIcon, QPixmap
+from PySide6.QtCore import QLibraryInfo, QLocale, QPoint, QRect, QSize, Qt, QTimer, QTranslator
+from PySide6.QtGui import QAction, QColor, QFont, QFontMetrics, QGuiApplication, QIcon, QPainter, QPalette, QPixmap
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -37,6 +37,8 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSplitter,
     QStackedWidget,
+    QStyle,
+    QStyleOptionViewItem,
     QSystemTrayIcon,
     QTableWidget,
     QTableWidgetItem,
@@ -106,6 +108,96 @@ UPDATE_CHECK_EVERY_MS = 24 * 3600 * 1000  # 开着不关的话，每天查一次
 LOG_LINES = 2000  # 运行日志面板最多留这么多条，内存不会越用越多
 # 运行日志的筛选：（显示的文字, 显示哪些级别，None 表示全部）
 LOG_FILTERS = [("全部", None), ("警告和错误", ("warn", "error")), ("只看错误", ("error",))]
+
+
+ROOM_ROW_HEIGHT = 46  # 直播间列表的行高：主播名下面还有一行房间号
+PROGRESS_ROLE = Qt.ItemDataRole.UserRole + 2  # “弹幕内容”一格：说书进度（0～1），不是说书就没有
+SELECT_HINT = "点一行选中直播间，按住 Ctrl 或 Shift 可多选；双击编辑，右键有更多操作"
+
+
+class RoomDelegate(NoFocusDelegate):
+    """直播间列表的画法：主播名下面一行小字房间号；状态画成一块圆角色块；说书的那一格下面有一条进度条。"""
+
+    def _background(self, painter, option, index) -> QStyleOptionViewItem:
+        """先把这一格的底色（隔行色、选中色）画好，文字自己画。"""
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        text = opt.text
+        opt.text = ""
+        style = opt.widget.style() if opt.widget else QApplication.style()
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, opt.widget)
+        opt.text = text
+        return opt
+
+    @staticmethod
+    def _small(font: QFont) -> QFont:
+        small = QFont(font)
+        small.setPointSizeF(max(font.pointSizeF() - 1, 7))
+        return small
+
+    def sizeHint(self, option, index) -> QSize:
+        size = super().sizeHint(option, index)
+        if index.column() == COL_STATUS:
+            size.setWidth(size.width() + 20)
+        return size
+
+    def paint(self, painter, option, index) -> None:
+        column = index.column()
+        if column not in (COL_NAME, COL_STATUS) and not (column == COL_MESSAGE and index.data(PROGRESS_ROLE) is not None):
+            super().paint(painter, option, index)
+            return
+        opt = self._background(painter, option, index)
+        rect = opt.rect.adjusted(6, 0, -6, 0)
+        colors = StatusColors()
+        text_color = opt.palette.color(QPalette.ColorRole.Text)
+        middle = Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if column == COL_NAME:
+            small = self._small(opt.font)
+            metrics, small_metrics = QFontMetrics(opt.font), QFontMetrics(small)
+            top = rect.top() + (rect.height() - metrics.height() - small_metrics.height() - 1) // 2
+            painter.setFont(opt.font)
+            painter.setPen(text_color)
+            painter.drawText(QRect(rect.left(), top, rect.width(), metrics.height()), middle,
+                             metrics.elidedText(opt.text, Qt.TextElideMode.ElideRight, rect.width()))
+            room_id = index.sibling(index.row(), COL_ROOM).data() or ""
+            painter.setFont(small)
+            painter.setPen(QColor(colors.muted))
+            painter.drawText(QRect(rect.left(), top + metrics.height() + 1, rect.width(), small_metrics.height()), middle, f"房间 {room_id}")
+        elif column == COL_STATUS:
+            color = index.data(Qt.ItemDataRole.ForegroundRole)
+            color = QColor(color.color() if hasattr(color, "color") else color) if color else QColor(colors.muted)
+            small = self._small(opt.font)
+            small.setBold(opt.font.bold())
+            metrics = QFontMetrics(small)
+            width = min(metrics.horizontalAdvance(opt.text) + 16, rect.width())
+            pill = QRect(rect.left(), rect.top() + (rect.height() - 22) // 2, width, 22)
+            tint = QColor(color)
+            tint.setAlphaF(0.16)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(tint)
+            painter.drawRoundedRect(pill, 6, 6)
+            painter.setFont(small)
+            painter.setPen(color)
+            painter.drawText(pill.adjusted(8, 0, -8, 0), middle, metrics.elidedText(opt.text, Qt.TextElideMode.ElideRight, width - 16))
+        else:
+            metrics = QFontMetrics(opt.font)
+            top = rect.top() + (rect.height() - metrics.height() - 8) // 2
+            painter.setFont(opt.font)
+            painter.setPen(text_color)
+            painter.drawText(QRect(rect.left(), top, rect.width(), metrics.height()), middle,
+                             metrics.elidedText(opt.text, Qt.TextElideMode.ElideRight, rect.width()))
+            bar = QRect(rect.left(), top + metrics.height() + 4, min(rect.width(), 320), 4)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(colors.line))
+            painter.drawRoundedRect(bar, 2, 2)
+            done = QRect(bar)
+            done.setWidth(round(bar.width() * max(0.0, min(1.0, float(index.data(PROGRESS_ROLE))))))
+            if done.width() > 0:
+                painter.setBrush(QGuiApplication.palette().color(QPalette.ColorRole.Highlight))
+                painter.drawRoundedRect(done, 2, 2)
+        painter.restore()
 
 
 def _dot(color: str) -> str:
@@ -208,27 +300,25 @@ class MainWindow(QMainWindow):
         root.setContentsMargins(16, 14, 16, 14)
         root.setSpacing(12)
 
-        # ---- 顶部卡片：监控状态
-        card = QFrame()
-        card.setObjectName("card")
-        grid = QGridLayout(card)
-        grid.setContentsMargins(16, 10, 16, 10)
-        grid.setHorizontalSpacing(12)
-
+        # ---- 顶部一行：监控状态
         self.monitor_label = QLabel()
         self.pause_btn = QPushButton("暂停监控")
         self.pause_btn.clicked.connect(self._toggle_pause)
         self.poll_btn = QPushButton("立即检测")
         self.poll_btn.setToolTip("不等倒计时，马上查一次所有直播间的开播状态")
         self.poll_btn.clicked.connect(self.engine.request_poll)
-        grid.addWidget(self._caption("监控"), 0, 0)
-        grid.addWidget(self.monitor_label, 0, 1)
-        grid.addWidget(self.pause_btn, 0, 2)
-        grid.addWidget(self.poll_btn, 0, 3)
-        grid.setColumnStretch(1, 1)
+        top_bar = QHBoxLayout()
+        top_bar.setSpacing(8)
+        top_bar.addWidget(self.monitor_label, 1)
+        top_bar.addWidget(self.poll_btn)
+        top_bar.addWidget(self.pause_btn)
+        top_line = QFrame()
+        top_line.setFrameShape(QFrame.Shape.HLine)
+        top_line.setStyleSheet("color: palette(mid);")
 
         # ---- 直播间列表
         self.add_btn = QPushButton("＋ 添加直播间")
+        self.add_btn.setObjectName("primaryButton")
         self.add_btn.clicked.connect(self._add_room)
         self.edit_btn = QPushButton("编辑")
         self.edit_btn.clicked.connect(self._edit_room)
@@ -243,16 +333,7 @@ class MainWindow(QMainWindow):
         self.stop_btn.setToolTip(SESSION_HINT)
         self.stop_btn.clicked.connect(self._stop_session)
 
-        bar = QHBoxLayout()
-        bar.addWidget(self._section_title("直播间"))
-        bar.addSpacing(8)
-        for button in (self.add_btn, self.edit_btn, self.delete_btn, self.open_btn):
-            bar.addWidget(button)
-        bar.addStretch(1)
-        bar.addWidget(self.start_btn)
-        bar.addWidget(self.stop_btn)
-
-        # 第二行：全选（启用 / 停用全部）、搜索、多选提示
+        # 第一行：全选（启用 / 停用全部）、搜索、添加
         self.all_check = QCheckBox("全选")
         self.all_check.setTristate(True)
         self.all_check.setToolTip("勾上＝监控列表里的全部直播间，取消＝全部不监控。搜索时只作用于搜到的直播间")
@@ -260,20 +341,28 @@ class MainWindow(QMainWindow):
         self.room_search = QLineEdit()
         self.room_search.setPlaceholderText("搜索主播、房间号或弹幕内容")
         self.room_search.setClearButtonEnabled(True)
-        self.room_search.setMaximumWidth(340)
         self.room_search.textChanged.connect(self._apply_room_filter)
         filter_bar = QHBoxLayout()
+        filter_bar.setSpacing(12)
         filter_bar.addWidget(self.all_check)
-        filter_bar.addSpacing(12)
         filter_bar.addWidget(self.room_search, 1)
-        filter_bar.addStretch(1)
-        multi_hint = hint_label("按住 Ctrl 或 Shift 可多选，批量操作")
-        multi_hint.setWordWrap(False)
-        filter_bar.addWidget(multi_hint)
+        filter_bar.addWidget(self.add_btn)
+
+        # 第二行：选中直播间后，对它们的操作都在这一条里；没选中时是一句提示
+        self.selection_label = QLabel()
+        self.selection_bar = QFrame()
+        self.selection_bar.setObjectName("selectionBar")
+        bar = QHBoxLayout(self.selection_bar)
+        bar.setContentsMargins(2, 4, 0, 4)
+        bar.setSpacing(6)
+        bar.addWidget(self.selection_label, 1)
+        for button in (self.edit_btn, self.open_btn, self.start_btn, self.stop_btn, self.delete_btn):
+            bar.addWidget(button)
+        self.selection_bar.setFixedHeight(self.edit_btn.sizeHint().height() + 8)
 
         self.table = QTableWidget(0, len(COLUMNS))
         self.table.setHorizontalHeaderLabels(COLUMNS)
-        self.table.setItemDelegate(NoFocusDelegate(self.table))
+        self.table.setItemDelegate(RoomDelegate(self.table))
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
@@ -281,13 +370,14 @@ class MainWindow(QMainWindow):
         self.table.setShowGrid(False)
         self.table.setWordWrap(False)
         self.table.verticalHeader().setVisible(False)
-        self.table.verticalHeader().setDefaultSectionSize(38)
+        self.table.verticalHeader().setDefaultSectionSize(ROOM_ROW_HEIGHT)
         header = self.table.horizontalHeader()
         header.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         header.setHighlightSections(False)
         for column in range(len(COLUMNS)):
             header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(COL_MESSAGE, QHeaderView.ResizeMode.Stretch)
+        self.table.setColumnHidden(COL_ROOM, True)  # 房间号画在主播名下面，这一列只存数据
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._show_context_menu)
         self.table.itemChanged.connect(self._on_item_changed)
@@ -305,8 +395,8 @@ class MainWindow(QMainWindow):
         rooms_layout = QVBoxLayout(rooms_panel)
         rooms_layout.setContentsMargins(0, 0, 0, 0)
         rooms_layout.setSpacing(8)
-        rooms_layout.addLayout(bar)
         rooms_layout.addLayout(filter_bar)
+        rooms_layout.addWidget(self.selection_bar)
         rooms_layout.addWidget(self.table_stack, 1)
 
         # ---- 运行日志
@@ -325,7 +415,13 @@ class MainWindow(QMainWindow):
         clear_btn = QPushButton("清空")
         clear_btn.clicked.connect(self._clear_log)
         log_bar = QHBoxLayout()
-        log_bar.addWidget(self._section_title("运行日志"))
+        self.log_toggle = QPushButton("▾ 运行日志")
+        self.log_toggle.setObjectName("logToggle")
+        self.log_toggle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.log_toggle.setToolTip("收起 / 展开运行日志")
+        self.log_toggle.clicked.connect(self._toggle_log)
+        self._log_clear_btn = clear_btn
+        log_bar.addWidget(self.log_toggle)
         log_bar.addSpacing(8)
         log_bar.addWidget(self.log_level_combo)
         log_bar.addWidget(self.log_search, 1)
@@ -338,6 +434,7 @@ class MainWindow(QMainWindow):
         log_layout.setSpacing(6)
         log_layout.addLayout(log_bar)
         log_layout.addWidget(self.log_view, 1)
+        self._log_panel = log_panel
 
         splitter = QSplitter(Qt.Orientation.Vertical)
         splitter.setChildrenCollapsible(False)
@@ -346,12 +443,18 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
 
-        root.addWidget(card)
+        root.addLayout(top_bar)
+        root.addWidget(top_line)
         root.addWidget(splitter, 1)
+        self._splitter = splitter
 
         c = self.colors
         self.setStyleSheet(
             "QFrame#card { border: 1px solid palette(mid); border-radius: 8px; background: palette(base); }"
+            # 主按钮（添加直播间）、选中后的操作条、运行日志的标题
+            "QFrame#selectionBar { border-radius: 6px; background: transparent; }"
+            "QPushButton#logToggle { border: none; background: transparent; text-align: left; padding: 2px 0;"
+            " font-size: 11pt; font-weight: bold; }"
             # 选中行画成一整条，而不是每格一个圆角块
             f"QTableWidget {{ selection-background-color: {c.selection}; selection-color: palette(text); }}"
             "QTableWidget::item { padding: 0 6px; border: none; }"
@@ -363,6 +466,12 @@ class MainWindow(QMainWindow):
             f"QPushButton[nav='true']:hover, QPushButton#account:hover {{ background: {c.hover}; }}"
             f"QPushButton[nav='true']:checked {{ background: {c.selection}; font-weight: bold; }}"
             "QPushButton#account { padding: 6px 8px; }"
+            # 功能栏、账号、日志标题这几个不是普通按钮：鼠标移上去不变粉、不描边
+            "QPushButton[nav='true'], QPushButton#account, QPushButton#logToggle { color: palette(window-text); }"
+            "QPushButton[nav='true']:hover, QPushButton#account:hover, QPushButton#logToggle:hover,"
+            " QPushButton[nav='true']:focus, QPushButton#account:focus, QPushButton#logToggle:focus"
+            " { color: palette(window-text); border: none; }"
+            "QPushButton#logToggle:pressed { background: transparent; }"
         )
 
     def _build_sidebar(self) -> QFrame:
@@ -575,6 +684,8 @@ class MainWindow(QMainWindow):
         self._set_cell(row, COL_STATUS, text, color, bold, tooltip=status_tip)
         content, content_tip = self._content_text(room, view)
         self._set_cell(row, COL_MESSAGE, content, tooltip=content_tip)
+        story_on = room.sends and room.mode == MODE_STORY and view is not None and view.story_len
+        self._cell(row, COL_MESSAGE).setData(PROGRESS_ROLE, view.story_pos / view.story_len if story_on else None)
         self._set_cell(row, COL_INTERVAL, room.interval_text(), tooltip=room.limits_text())
         counting = view is not None and view.session in (
             Session.SENDING, Session.STOPPED, Session.MUTED, Session.FINISHED, Session.LIMITED
@@ -599,6 +710,13 @@ class MainWindow(QMainWindow):
             tip = f"说书进度：已说到第 {view.story_pos:,} 字，剩余 {view.story_len - view.story_pos:,} 字"
         else:
             progress, tip = "", ""
+        titles = view.story_part_titles if view else ()
+        if len(titles) > 1:  # 发送序列：显示正在说的那一组，提示里列出整个序列
+            index = min(view.story_part, len(titles) - 1)
+            tip += "\n发送序列：\n" + "\n".join(
+                f"{i + 1}. 《{title}》" + ("　← 正在说" if i == index else "") for i, title in enumerate(titles)
+            )
+            return f"【说书】《{titles[index]}》（第 {index + 1}/{len(titles)} 组）　{progress}", tip.strip()
         return f"【说书】《{room.story_title}》　{progress}", tip
 
     def _status_of(self, room: RoomConfig, view: RoomView | None) -> tuple[str, str, bool]:
@@ -657,6 +775,22 @@ class MainWindow(QMainWindow):
         self.edit_btn.setEnabled(count == 1)
         for button in (self.delete_btn, self.open_btn, self.start_btn, self.stop_btn):
             button.setEnabled(count > 0)
+        for button in (self.edit_btn, self.delete_btn, self.open_btn, self.start_btn, self.stop_btn):
+            button.setVisible(count > 0)
+        if count:
+            self.selection_label.setStyleSheet("")
+            self.selection_label.setText(f"已选中 {count} 个直播间")
+        else:
+            self.selection_label.setStyleSheet(f"color: {self.colors.muted};")
+            self.selection_label.setText(SELECT_HINT)
+
+    def _toggle_log(self) -> None:
+        """收起 / 展开运行日志：收起后只剩标题那一行，地方都让给直播间列表。"""
+        show = not self.log_view.isVisible()
+        for widget in (self.log_view, self.log_level_combo, self.log_search, self._log_clear_btn):
+            widget.setVisible(show)
+        self.log_toggle.setText("▾ 运行日志" if show else "▸ 运行日志")
+        self._log_panel.setMaximumHeight(16777215 if show else self.log_toggle.sizeHint().height() + 4)
 
     def _rooms_changed(self) -> None:
         self._save_config()

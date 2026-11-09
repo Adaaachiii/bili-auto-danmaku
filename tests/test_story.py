@@ -1,4 +1,4 @@
-"""说书人模式测试：切分规则、说完停止 / 循环、状态继承、过滤跳过、限流重发、随机间隔、一百万字的速度。
+"""说书人模式测试：切分规则、说完停止 / 循环、状态继承、过滤跳过、限流重发、发送序列、随机间隔、一百万字的速度。
 
 运行：python tests/test_story.py（不联网，B 站接口都换成假的）。
 """
@@ -131,6 +131,71 @@ story.save_room_story(1, "甲乙丙丁戊己庚辛")
 e.set_rooms([replace(room, story_hash=hash_, story_chars=chars)])
 assert e.view(1).story_pos == 0
 print("换文字后从头 OK")
+
+# ---- 发送序列：存进一个文件再拆回来；只有一组时和以前的文件一模一样
+Part = story.StoryPart
+queue = [Part("甲", "一二三四五\n六七"), Part("乙", "八九十\n"), Part("丙", "子丑")]
+raw = story.join_parts(queue)
+assert [(p.title, p.text.strip()) for p in story.split_parts(raw)] == [(p.title, p.text.strip()) for p in queue]
+assert story.join_parts([Part("书", "一二三")]) == "一二三"
+assert story.split_parts("一二三", "书")[0].title == "书" and story.split_parts("  \n") == []
+assert StoryText("一二三").hash == StoryText(story.join_parts([Part("书", "一二三")])).hash  # 旧的进度照样能用
+mark = story.PART_MARK
+weird = story.join_parts([Part(f"a{mark}b\nc", f"x{mark}y\n{mark}w"), Part("d", "z")])  # 标题、正文里的分组标记去掉，不会弄乱序列
+assert [(p.title, p.text) for p in story.split_parts(weird)] == [("ab c", "xy\nw"), ("d", "z")]
+assert story.queue_title(queue) == "甲 等 3 组" and story.queue_title(queue[:1]) == "甲"
+print("发送序列存取 OK")
+
+# ---- 发送序列的切分：组内照样按设置跨行，但一条弹幕不跨组
+t = StoryText(raw)
+assert t.stream == "一二三四五六七八九十子丑" and t.parts == [("甲", 0, 7), ("乙", 7, 10), ("丙", 10, 12)], t.parts
+assert t.next_chunk(0, 10, by_line=False) == ("一二三四五 六七", 7)
+assert t.next_chunk(5, 10, by_line=True) == ("六七", 7)
+assert [t.part_at(p) for p in (0, 6, 7, 10, 12)] == [0, 0, 1, 2, 2]
+assert t.hash != StoryText(story.join_parts([Part("甲", "一二三四五\n六七"), Part("乙改", "八九十"), Part("丙", "子丑")])).hash
+# 改了以后从哪里接着说：说过的部分没变就接着说，变了就从头
+longer = StoryText(story.join_parts(queue + [Part("丁", "寅卯")]))
+assert story.kept_position(t, longer, 9) == 9 and story.kept_position(t, longer, 12) == 12
+assert story.kept_position(t, StoryText(story.join_parts(queue[1:])), 9) == 0
+assert story.kept_position(None, longer, 9) == 0 and story.kept_position(t, longer, 0) == 0
+print("发送序列切分 OK")
+
+# ---- 发送序列：说完一组接着说下一组，全部说完才停；日志里说正在说第几组
+for loop, expect in ((False, ["一二三四", "五", "六七八"]), (True, ["一二三四", "五", "六七八", "一二三四"])):
+    sent.clear()
+    e, room = make(story.join_parts([Part("甲", "一二三四五"), Part("乙", "六七八")]), story_loop=loop)
+    logs: list[str] = []
+    e.log_message.connect(lambda _level, text: logs.append(text))
+    live(e)
+    assert e.view(1).story_part_titles == ("甲", "乙") and e.view(1).story_part == 0
+    for _ in range(len(expect)):
+        tick(e)
+    assert sent == expect, (loop, sent)
+    assert any("第 1/2 组《甲》" in line for line in logs) and any("第 2/2 组《乙》" in line for line in logs), logs
+    if not loop:
+        assert e.view(1).session is Session.FINISHED and e.view(1).story_part == 1
+        assert any("2 组文字" in line for line in logs), logs
+print("发送序列按顺序说 OK")
+
+# ---- 说完以后在序列后面加一组：马上接着说新加的，不从头；改了说过的部分才从头
+sent.clear()
+e, room = make("一二三四")
+live(e); tick(e)
+assert e.view(1).session is Session.FINISHED
+appended = story.join_parts([Part("甲", "一二三四"), Part("乙", "五六七")])
+hash_, chars = story.text_fingerprint(appended)
+story.save_room_story(1, appended)
+e.set_rooms([replace(room, story_hash=hash_, story_chars=chars)])
+assert e.view(1).story_pos == 4 and e.view(1).session is Session.SENDING, e.view(1)
+tick(e)
+assert sent == ["一二三四", "五六七"], sent
+assert story.load_progress()[1] == (7, hash_), "进度要跟着新的内容存下来，重启后还能接着说"
+changed = story.join_parts([Part("甲", "一二三X"), Part("乙", "五六七")])
+hash_, chars = story.text_fingerprint(changed)
+story.save_room_story(1, changed)
+e.set_rooms([replace(room, story_hash=hash_, story_chars=chars)])
+assert e.view(1).story_pos == 0
+print("序列后面加内容接着说 OK")
 
 # ---- 随机间隔
 r = RoomConfig(room_id=9, interval_sec=5, interval_random=True, interval_max_sec=9)

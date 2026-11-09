@@ -202,6 +202,7 @@ class LiveStatus:
     uname: str
     title: str
     live_status: int
+    face: str = ""  # 主播头像图片地址
 
 
 def get_live_status_by_uids(session: requests.Session, uids: list[int]) -> dict[int, LiveStatus]:
@@ -217,6 +218,7 @@ def get_live_status_by_uids(session: requests.Session, uids: list[int]) -> dict[
             uname=str(item.get("uname") or ""),
             title=str(item.get("title") or ""),
             live_status=int(item.get("live_status") or 0),
+            face=str(item.get("face") or ""),
         )
     return result
 

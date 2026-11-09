@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QHeaderView,
     QLabel,
@@ -28,7 +29,16 @@ from PySide6.QtWidgets import (
 
 from .favorites import Favorite, FavoritesStore, FavoriteSummary, count_chars
 from .story import read_text_file
-from .ui_common import NoFocusDelegate, exact_chars, format_chars, hint_label, plain_tip, save_cancel_buttons
+from .ui_common import (
+    NoFocusDelegate,
+    exact_chars,
+    format_chars,
+    help_icon,
+    hint_label,
+    make_primary,
+    plain_tip,
+    save_cancel_buttons,
+)
 from .ui_tags import TagEditor
 
 # 预览区只显示开头这么多字，整本小说塞进预览框会很慢，也没必要
@@ -65,7 +75,8 @@ class FavoritesBrowser(QWidget):
 
     COLUMNS = ["标题", "标签", "字数", "内容预览"]
 
-    def __init__(self, store: FavoritesStore, parent: QWidget | None = None):
+    def __init__(self, store: FavoritesStore, parent: QWidget | None = None, multi: bool = False, side_preview: bool = False):
+        """side_preview：预览放在列表右边（收藏夹页面用），预览上面是这条收藏的标题和 preview_actions 里的按钮。"""
         super().__init__(parent)
         self.store = store
         self._rows: list[FavoriteSummary] = []
@@ -85,7 +96,9 @@ class FavoritesBrowser(QWidget):
         self.table = QTableWidget(0, len(self.COLUMNS))
         self.table.setHorizontalHeaderLabels(self.COLUMNS)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection if multi else QAbstractItemView.SelectionMode.SingleSelection
+        )
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setAlternatingRowColors(True)
         self.table.setShowGrid(False)
@@ -107,12 +120,40 @@ class FavoritesBrowser(QWidget):
         self.preview.setReadOnly(True)
         self.preview.setPlaceholderText("选中一条收藏，这里显示它的内容")
 
-        splitter = QSplitter(Qt.Orientation.Vertical)
+        # 预览上面一行：这条收藏的标题、标签和字数，右边可以放按钮（收藏夹页面放“编辑 / 删除”）
+        self.preview_title = QLabel()
+        self.preview_title.setTextFormat(Qt.TextFormat.PlainText)
+        self.preview_title.setStyleSheet("font-weight: bold;")
+        self.preview_info = hint_label()
+        self.preview_info.setWordWrap(False)
+        self.preview_actions = QHBoxLayout()
+        self.preview_actions.setSpacing(6)
+        title_box = QVBoxLayout()
+        title_box.setSpacing(2)
+        title_box.addWidget(self.preview_title)
+        title_box.addWidget(self.preview_info)
+        preview_head = QHBoxLayout()
+        preview_head.addLayout(title_box, 1)
+        preview_head.addLayout(self.preview_actions)
+        preview_panel = QWidget()
+        preview_layout = QVBoxLayout(preview_panel)
+        preview_layout.setContentsMargins(8 if side_preview else 0, 0, 0, 0)
+        preview_layout.setSpacing(6)
+        preview_layout.addLayout(preview_head)
+        preview_layout.addWidget(self.preview, 1)
+        self._preview_head = (self.preview_title, self.preview_info)
+        for widget in self._preview_head:
+            widget.setVisible(side_preview)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal if side_preview else Qt.Orientation.Vertical)
         splitter.setChildrenCollapsible(False)
         splitter.addWidget(self.table)
-        splitter.addWidget(self.preview)
+        splitter.addWidget(preview_panel)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
+        if side_preview:
+            self.table.setColumnHidden(3, True)  # 旁边就是完整的预览，列表里不用再放一列
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -151,6 +192,8 @@ class FavoritesBrowser(QWidget):
                 break
         else:
             self.preview.clear()
+            self.preview_title.setText("")
+            self.preview_info.setText("")
             self.selection_changed.emit()
 
     def _reload_tags(self) -> None:
@@ -170,12 +213,26 @@ class FavoritesBrowser(QWidget):
             return None
         return self._rows[rows[0].row()].id
 
+    def selected_ids(self) -> list[int]:
+        """选中的几条（可以多选时），按列表里的顺序。"""
+        rows = sorted(index.row() for index in self.table.selectionModel().selectedRows())
+        return [self._rows[row].id for row in rows if row < len(self._rows)]
+
     def _on_selection_changed(self) -> None:
+        current = self.table.currentRow()
         favorite_id = self.selected_id()
+        if 0 <= current < len(self._rows) and self._rows[current].id in self.selected_ids():
+            favorite_id = self._rows[current].id  # 多选时预览最后点的那一条
         favorite = self.store.get(favorite_id) if favorite_id is not None else None
         if favorite is None:
             self.preview.clear()
+            self.preview_title.setText("")
+            self.preview_info.setText("")
         else:
+            self.preview_title.setText(favorite.title)
+            self.preview_title.setToolTip(plain_tip(favorite.title))
+            tags = "、".join(favorite.tags)
+            self.preview_info.setText((tags + "　" if tags else "") + exact_chars(count_chars(favorite.content)))
             text = favorite.content
             if len(text) > PREVIEW_LIMIT:
                 text = text[:PREVIEW_LIMIT] + f"\n\n……（共 {format_chars(len(favorite.content))}，这里只显示前 {PREVIEW_LIMIT} 字）"
@@ -274,9 +331,9 @@ class FavoritesPage(QWidget):
     def __init__(self, store: FavoritesStore, parent: QWidget | None = None):
         super().__init__(parent)
         self.store = store
-        self.browser = FavoritesBrowser(store)
+        self.browser = FavoritesBrowser(store, side_preview=True)
 
-        self.new_btn = QPushButton("＋ 新建")
+        self.new_btn = make_primary(QPushButton("＋ 新建"))
         self.new_btn.clicked.connect(lambda: self._new())  # clicked 会带一个参数，不能直接连到 _new
         self.import_btn = QPushButton("导入 txt")
         self.import_btn.clicked.connect(self._import)
@@ -287,16 +344,18 @@ class FavoritesPage(QWidget):
 
         bar = QHBoxLayout()
         bar.addWidget(_section_title("弹幕收藏夹"))
-        bar.addSpacing(8)
-        for button in (self.new_btn, self.import_btn, self.edit_btn, self.delete_btn):
-            bar.addWidget(button)
+        bar.addWidget(help_icon("每条收藏有自己的标题（小类），可以贴多个标签（大类）。收藏不限字数，长文字可以用在说书人模式。"))
         bar.addStretch(1)
+        bar.addWidget(self.import_btn)
+        bar.addWidget(self.new_btn)
+        # “编辑 / 删除”管的是选中的那一条，放在右边预览的标题旁边
+        self.browser.preview_actions.addWidget(self.edit_btn)
+        self.browser.preview_actions.addWidget(self.delete_btn)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(10)
         layout.addLayout(bar)
-        layout.addWidget(hint_label("每条收藏有自己的标题（小类），可以贴多个标签（大类）。收藏不限字数，长文字可以用在说书人模式。"))
         layout.addWidget(self.browser, 1)
 
         self.browser.selection_changed.connect(self._update_buttons)
@@ -353,40 +412,58 @@ class FavoritesPage(QWidget):
 
 
 class FavoritePickerDialog(QDialog):
-    """挑一条收藏。max_chars 不为 None 时，超过这个字数的不能选（独轮车模式一条最多 40 字）。"""
+    """挑一条收藏。max_chars 不为 None 时，超过这个字数的不能选（独轮车模式一条最多 40 字）。
 
-    def __init__(self, parent: QWidget | None, store: FavoritesStore, max_chars: int | None = None):
+    multi 为 True 时可以一次挑好几条（说书人模式加入发送序列），结果在 result_favorites，按列表里的顺序。
+    """
+
+    def __init__(self, parent: QWidget | None, store: FavoritesStore, max_chars: int | None = None, multi: bool = False):
         super().__init__(parent)
         self.setWindowTitle("从收藏夹选择")
         self.resize(820, 560)
         self.store = store
         self.max_chars = max_chars
+        self.multi = multi
         self.result_favorite: Favorite | None = None
+        self.result_favorites: list[Favorite] = []
 
-        self.browser = FavoritesBrowser(store)
-        self.buttons = save_cancel_buttons(self, "使用这条")
+        self.browser = FavoritesBrowser(store, multi=multi)
+        self.buttons = save_cancel_buttons(self, "加入发送序列" if multi else "使用这条")
         layout = QVBoxLayout(self)
         if max_chars is not None:
             layout.addWidget(hint_label(f"独轮车模式一条弹幕最多 {max_chars} 字；更长的收藏请在说书人模式里使用。"))
+        if multi:
+            layout.addWidget(hint_label("按住 Ctrl 或 Shift 可以一次选好几条，按列表里的顺序加入发送序列。"))
         layout.addWidget(self.browser, 1)
         layout.addWidget(self.buttons)
 
         self.browser.selection_changed.connect(self._update_button)
-        self.browser.activated.connect(lambda _id: self.accept())
+        self.browser.activated.connect(self._use_one)
         self._update_button()
 
     def _update_button(self) -> None:
-        self.buttons.button(QDialogButtonBox.StandardButton.Save).setEnabled(self.browser.selected_id() is not None)
+        count = len(self.browser.selected_ids())
+        save = self.buttons.button(QDialogButtonBox.StandardButton.Save)
+        save.setEnabled(count > 0)
+        if self.multi:
+            save.setText(f"加入发送序列（{count} 条）" if count > 1 else "加入发送序列")
+
+    def _use_one(self, favorite_id: int) -> None:
+        """双击：就用双击的这一条。"""
+        self._finish([favorite_id])
 
     def accept(self) -> None:
-        favorite_id = self.browser.selected_id()
-        favorite = self.store.get(favorite_id) if favorite_id is not None else None
-        if favorite is None:
+        self._finish(self.browser.selected_ids())
+
+    def _finish(self, ids: list[int]) -> None:
+        favorites = [favorite for favorite in (self.store.get(i) for i in ids) if favorite is not None]
+        if not favorites:
             return
-        if self.max_chars is not None and len(favorite.content.strip()) > self.max_chars:
+        if self.max_chars is not None and len(favorites[0].content.strip()) > self.max_chars:
             QMessageBox.information(
-                self, "太长了", f"这条收藏有 {len(favorite.content.strip())} 字，独轮车模式一条最多 {self.max_chars} 字。"
+                self, "太长了", f"这条收藏有 {len(favorites[0].content.strip())} 字，独轮车模式一条最多 {self.max_chars} 字。"
             )
             return
-        self.result_favorite = favorite
+        self.result_favorite = favorites[0]
+        self.result_favorites = favorites
         super().accept()

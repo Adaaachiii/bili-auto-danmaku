@@ -9,10 +9,11 @@ from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
-    QFormLayout,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -29,7 +30,7 @@ from .config import (
     AppConfig,
     data_dir,
 )
-from .ui_common import StatusColors, hint_label, set_colored, unit_row
+from .ui_common import StatusColors, help_icon, hint_label, make_primary, set_colored, titled_section
 
 
 def _combo(choices: dict[str, str]) -> QComboBox:
@@ -72,48 +73,49 @@ class SettingsPage(QWidget):
         self.autostart_check = QCheckBox("开机自动启动（启动后直接缩小到托盘）")
         self.auto_update_check = QCheckBox("自动检查更新")
 
-        form = QFormLayout()
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        form.setVerticalSpacing(10)
-        form.addRow("检测间隔：", unit_row(self.poll_spin))
-        form.addRow("", hint_label("检测间隔建议大于30秒"))
-        form.addRow("", self.auto_monitor_check)
-        auto_hint = hint_label("关闭后，程序启动时先暂停监控，点“继续监控”才开始检测和发送")
-        auto_hint.setWordWrap(False)
-        form.addRow("", auto_hint)
-        form.addRow("", self.send_on_startup_check)
-        startup_hint = hint_label("程序打开时主播已经在播的直播间直接开始发送，不用点“本场开始发送”")
-        startup_hint.setWordWrap(False)
-        form.addRow("", startup_hint)
-        form.addRow("打开直播页用：", self.browser_combo)
-        form.addRow("关闭窗口时：", self.close_combo)
-        form.addRow("外观：", self.theme_combo)
-        form.addRow("", self.notify_check)
-        notify_hint = hint_label("“只提醒”的直播间不受这个开关影响，开播、下播总会提醒")
-        notify_hint.setWordWrap(False)
-        form.addRow("", notify_hint)
-        form.addRow("", self.autostart_check)
-        form.addRow("", self.auto_update_check)
+        label_width = max(QLabel(text).sizeHint().width() for text in ("检测间隔", "打开直播页用", "关闭窗口时", "外观")) + 16
 
-        folder = str(data_dir())
-        folder_label = hint_label(f"配置、收藏夹和日志保存在：{folder}")
-        folder_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        open_btn = QPushButton("打开文件夹")
-        open_btn.clicked.connect(lambda: os.startfile(folder))
-        folder_row = QHBoxLayout()
-        folder_row.addWidget(folder_label, 1)
-        folder_row.addWidget(open_btn)
+        def field(text: str) -> QLabel:
+            label = hint_label(text)  # 次要文字色
+            label.setWordWrap(False)
+            label.setFixedWidth(label_width)
+            return label
 
-        backup_btn = QPushButton("导出备份…")
-        backup_btn.clicked.connect(self.backup_requested.emit)
-        restore_btn = QPushButton("从备份恢复…")
-        restore_btn.clicked.connect(self.restore_requested.emit)
-        backup_row = QHBoxLayout()
-        backup_row.addWidget(hint_label("备份包含直播间和设置、收藏夹、历史记录、说书文字和进度、屏蔽词整理表（不含登录、运行日志和表情图片）"), 1)
-        backup_row.addWidget(backup_btn)
-        backup_row.addWidget(restore_btn)
+        def row(*items) -> QHBoxLayout:
+            line = QHBoxLayout()
+            line.setSpacing(8)
+            for item in items:
+                if isinstance(item, int):
+                    line.addSpacing(item)
+                else:
+                    line.addWidget(item)
+            line.addStretch(1)
+            return line
 
-        self.save_btn = QPushButton("保存设置")
+        def short_hint(text: str) -> QLabel:
+            label = hint_label(text)
+            label.setWordWrap(False)
+            return label
+
+        # ---- 监控与发送
+        monitor = QVBoxLayout()
+        monitor.setSpacing(8)
+        monitor.addLayout(row(field("检测间隔"), self.poll_spin, QLabel("秒"), 8, short_hint("检测间隔建议大于30秒")))
+        monitor.addLayout(row(self.auto_monitor_check, help_icon("关闭后，程序启动时先暂停监控，点“继续监控”才开始检测和发送")))
+        monitor.addLayout(row(self.send_on_startup_check, help_icon("程序打开时主播已经在播的直播间直接开始发送，不用点“本场开始发送”")))
+
+        # ---- 窗口与通知
+        window = QVBoxLayout()
+        window.setSpacing(8)
+        window.addLayout(row(field("打开直播页用"), self.browser_combo))
+        window.addLayout(row(field("关闭窗口时"), self.close_combo))
+        window.addLayout(row(field("外观"), self.theme_combo))
+        window.addLayout(row(self.notify_check, help_icon("“只提醒”的直播间不受这个开关影响，开播、下播总会提醒")))
+        window.addLayout(row(self.autostart_check))
+        window.addLayout(row(self.auto_update_check))
+
+        # ---- 保存
+        self.save_btn = make_primary(QPushButton("保存设置"))
         self.save_btn.setDefault(True)
         self.save_btn.clicked.connect(self.saved.emit)
         self.saved_label = QLabel()
@@ -122,26 +124,35 @@ class SettingsPage(QWidget):
         self._saved_timer.setSingleShot(True)
         self._saved_timer.setInterval(2500)
         self._saved_timer.timeout.connect(self.saved_label.clear)
-        save_row = QHBoxLayout()
-        save_row.setContentsMargins(0, 8, 0, 0)
-        save_row.addWidget(self.save_btn)
-        save_row.addWidget(self.saved_label)
-        save_row.addStretch(1)
-        form.addRow("", save_row)  # 放进表单，和上面的勾选框左边对齐
+        save_row = row(self.save_btn, self.saved_label)
 
-        content = QWidget()
-        content.setMaximumWidth(720)
-        box = QVBoxLayout(content)
-        box.setContentsMargins(0, 0, 0, 0)
-        box.setSpacing(12)
-        box.addLayout(form)
-        box.addSpacing(12)
-        box.addLayout(folder_row)
-        box.addLayout(backup_row)
+        # ---- 数据
+        folder = str(data_dir())
+        folder_label = hint_label(f"配置、收藏夹和日志保存在：{folder}")
+        folder_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        open_btn = QPushButton("打开文件夹")
+        open_btn.clicked.connect(lambda: os.startfile(folder))
+        folder_row = QHBoxLayout()
+        folder_row.addWidget(folder_label, 1)
+        folder_row.addWidget(open_btn)
+        backup_btn = QPushButton("导出备份…")
+        backup_btn.clicked.connect(self.backup_requested.emit)
+        restore_btn = QPushButton("从备份恢复…")
+        restore_btn.clicked.connect(self.restore_requested.emit)
+        backup_row = QHBoxLayout()
+        backup_row.addWidget(hint_label("备份包含直播间和设置、收藏夹、历史记录、说书文字和进度、屏蔽词整理表（不含登录、运行日志和表情图片）"), 1)
+        backup_row.addWidget(backup_btn)
+        backup_row.addWidget(restore_btn)
+        data = QVBoxLayout()
+        data.setSpacing(8)
+        data.addLayout(folder_row)
+        data.addLayout(backup_row)
+
+        # ---- 关于
         version_row = QHBoxLayout()
-        version_label = hint_label(f"{APP_TITLE} {APP_VERSION}")
-        version_label.setWordWrap(False)
+        version_label = QLabel(f"{APP_TITLE} {APP_VERSION}")
         version_row.addWidget(version_label)
+        version_row.addSpacing(8)
         self.check_btn = QPushButton("检查更新")
         self.check_btn.clicked.connect(self.check_update_requested.emit)
         version_row.addWidget(self.check_btn)
@@ -151,32 +162,55 @@ class SettingsPage(QWidget):
             update_btn.clicked.connect(self.update_requested.emit)
             version_row.addWidget(update_btn)
         else:
-            source_hint = hint_label("（源码版，用 git pull 更新）")
-            source_hint.setWordWrap(False)
-            version_row.addWidget(source_hint)
+            version_row.addWidget(short_hint("（源码版，用 git pull 更新）"))
         notice_btn = QPushButton("使用须知")
         notice_btn.clicked.connect(self.notice_requested.emit)
         version_row.addWidget(notice_btn)
         version_row.addStretch(1)
-        box.addLayout(version_row)
         # 检查更新的结果：已是最新 / 有新版本（旁边是“更新到 x.y.z…”按钮）/ 出错
         self.update_label = hint_label()
         self.update_label.setWordWrap(False)
         self.install_btn = QPushButton()
         self.install_btn.clicked.connect(self.install_update_requested.emit)
-        update_row = QHBoxLayout()
+        self._update_row = QWidget()
+        update_row = QHBoxLayout(self._update_row)
+        update_row.setContentsMargins(0, 0, 0, 0)
         update_row.addWidget(self.update_label)
         update_row.addWidget(self.install_btn)
         update_row.addStretch(1)
-        box.addLayout(update_row)
+        about = QVBoxLayout()
+        about.setSpacing(8)
+        about.addLayout(version_row)
+        about.addWidget(self._update_row)
         self.show_update_status("")
+
+        content = QWidget()
+        content.setMaximumWidth(760)
+        box = QVBoxLayout(content)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(12)
+        box.addWidget(titled_section("监控与发送", monitor))
+        box.addWidget(titled_section("窗口与通知", window))
+        box.addLayout(save_row)
+        box.addSpacing(4)
+        box.addWidget(titled_section("数据", data))
+        box.addWidget(titled_section("关于", about))
+        box.addStretch(1)
+
+        # 窗口矮的时候可以滚动
+        scroll = QScrollArea()
+        scroll.setWidget(content)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.viewport().setAutoFillBackground(False)
+        content.setAutoFillBackground(False)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(12)
         layout.addWidget(title)
-        layout.addWidget(content)
-        layout.addStretch(1)
+        layout.addWidget(scroll, 1)
 
     def load(self, cfg: AppConfig, autostart: bool) -> None:
         self.poll_spin.setValue(cfg.poll_interval_sec)
@@ -207,6 +241,7 @@ class SettingsPage(QWidget):
         """检查更新的结果。new_version 不为空时显示“更新到 x.y.z…”按钮（源码版没有这个按钮，用 git pull 更新）。"""
         set_colored(self.update_label, text, color or StatusColors().muted)
         self.update_label.setVisible(bool(text))
+        self._update_row.setVisible(bool(text) or new_version is not None)
         self.install_btn.setVisible(new_version is not None and getattr(sys, "frozen", False))
         if new_version:
             self.install_btn.setText(f"更新到 {new_version}…")

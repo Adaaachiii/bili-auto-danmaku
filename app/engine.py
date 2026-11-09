@@ -75,6 +75,8 @@ class RoomView:
     story_pos: int  # 说书进度：已经说到第几个字
     story_len: int  # 说书文字的总字数（整理后）
     story_missing: bool  # 说书人模式但文字文件不见了
+    story_part: int = 0  # 发送序列：正在说第几组（从 0 数）
+    story_part_titles: tuple[str, ...] = ()  # 发送序列里每一组的标题；只有一组时就一个
 
 
 @dataclass
@@ -107,6 +109,7 @@ class _RoomState:
     error: str = ""
     story: StoryText | None = None
     story_pos: int = 0
+    story_part_shown: int = -1  # 发送序列：日志里已经提过正在说第几组，换到下一组时再提
     generation: int = 0  # 每开始一轮发送加 1，用来判断历史记录是不是该另起一条
     end_reason: str = ""  # 这一轮为什么停下，写进历史记录
     record_id: int | None = None  # 正在记的那条历史记录
@@ -139,6 +142,7 @@ class _RoomState:
         self.failures = 0
         self.first_send_at = None
         self.repeat_index = -1  # 每一轮都从文字（没有文字就从第一个表情）开始
+        self.story_part_shown = -1
         self.next_send_at = time.monotonic()
         if new_live and self.is_story and not self.cfg.story_inherit:
             self.story_pos = 0
@@ -163,6 +167,8 @@ class _RoomState:
             story_pos=self.story_pos,
             story_len=self.story.length if self.story else self.cfg.story_chars,
             story_missing=self.is_story and self.story is None,
+            story_part=self.story.part_at(self.story_pos) if self.story else 0,
+            story_part_titles=tuple(part[0] for part in self.story.parts) if self.story else (),
         )
 
 
@@ -355,7 +361,11 @@ class Engine(QObject):
     # ------------------------------------------------------------ 说书文字与进度
 
     def _sync_story(self, state: _RoomState, events: list[tuple]) -> None:
-        """说书文字有变化时重新读文件；文字换了，进度从头算。调用时已持有锁。"""
+        """说书文字有变化时重新读文件。调用时已持有锁。
+
+        内容改了的话，已经说过的那部分没变（比如在发送序列后面加了几组）就接着说，否则从头说；
+        原来已经说完了、现在后面又加了内容，能发的时候马上接着说。
+        """
         cfg = state.cfg
         if cfg.mode != MODE_STORY or not cfg.story_hash:
             state.story = None
@@ -368,9 +378,21 @@ class Engine(QObject):
             events.append(("log", "error", f"[{state.name}] 找不到说书文字文件，请编辑这个直播间重新设置说书内容"))
             return
         text = StoryText(raw)
-        saved = self._progress.get(cfg.room_id)
+        old = state.story
         state.story = text
-        state.story_pos = saved[0] if saved and saved[1] == text.hash and saved[0] <= text.length else 0
+        state.story_part_shown = -1
+        if old is None:  # 程序刚打开，或者刚换成说书人模式：用存下来的进度
+            saved = self._progress.get(cfg.room_id)
+            state.story_pos = saved[0] if saved and saved[1] == text.hash and saved[0] <= text.length else 0
+            return
+        state.story_pos = story.kept_position(old, text, state.story_pos)
+        self._record_progress(state)
+        if state.story_pos and state.session is Session.FINISHED and state.story_pos < text.length:
+            if cfg.enabled and cfg.sends and state.can_send_now():
+                state.begin_session()
+                events.append(("log", "info", f"[{state.name}] 说书内容后面加了新的内容，接着说{self._part_hint(state)}"))
+            else:
+                state.session = Session.IDLE
 
     def _record_progress(self, state: _RoomState) -> None:
         """把说书进度写进文件，程序重启后也能接着说。调用时已持有锁。"""
@@ -554,7 +576,16 @@ class Engine(QObject):
             return ""
         if state.story_pos == 0:
             return "（说书从头开始）"
-        return f"（说书接着上次，从 {state.story_pos / state.story.length:.1%} 处继续）"
+        return f"（说书接着上次，从 {state.story_pos / state.story.length:.1%} 处继续{Engine._part_hint(state, '，')}）"
+
+    @staticmethod
+    def _part_hint(state: _RoomState, prefix: str = "，") -> str:
+        """发送序列有好几组时，说一下正在说第几组；只有一组就不说。"""
+        text = state.story
+        if text is None or len(text.parts) < 2:
+            return ""
+        index = text.part_at(state.story_pos)
+        return f"{prefix}第 {index + 1}/{len(text.parts)} 组《{text.parts[index][0]}》"
 
     def _send_due(self, session) -> None:
         creds = self._creds
@@ -670,6 +701,10 @@ class Engine(QObject):
             skipped.append(chunk)
             state.story_pos = end
         self._note_skipped(state, skipped, events)
+        part = text.part_at(state.story_pos)
+        if len(text.parts) > 1 and part != state.story_part_shown:
+            state.story_part_shown = part
+            events.append(("log", "info", f"[{state.name}] 开始说发送序列里的{self._part_hint(state, '')}"))
         return _Pending(state.cfg.room_id, state.name, chunk, story_from=state.story_pos, story_to=end, generation=state.generation)
 
     def _note_skipped(self, state: _RoomState, skipped: list[str], events: list[tuple]) -> None:
@@ -684,8 +719,10 @@ class Engine(QObject):
     def _finish_story(self, state: _RoomState, events: list[tuple]) -> None:
         state.session = Session.FINISHED
         state.end_reason = "说书说完了"
-        events.append(("log", "info", f"[{state.name}] 说书说完了，停止发送（可以右键“说书从头开始”）"))
-        events.append(("notify", f"{state.name} 的说书说完了", "整段文字已经全部发完"))
+        parts = len(state.story.parts) if state.story else 1
+        what = f"发送序列里的 {parts} 组文字" if parts > 1 else "整段文字"
+        events.append(("log", "info", f"[{state.name}] 说书说完了（{what}都发完了），停止发送（可以右键“说书从头开始”）"))
+        events.append(("notify", f"{state.name} 的说书说完了", f"{what}已经全部发完"))
 
     def _handle_send_result(self, item: _Pending, result: SendResult, sent_at: float | None = None) -> None:
         events: list[tuple] = []

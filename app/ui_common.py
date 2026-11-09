@@ -27,12 +27,15 @@ from PySide6.QtWidgets import (
     QApplication,
     QDialog,
     QDialogButtonBox,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QPlainTextEdit,
+    QPushButton,
     QSpinBox,
     QStyle,
     QStyledItemDelegate,
+    QVBoxLayout,
     QWidget,
 )
 from shiboken6 import isValid
@@ -369,6 +372,90 @@ def with_help(widget: QWidget, tip: str) -> QHBoxLayout:
     return row
 
 
+# ---------------------------------------------------------------- 分组卡片、主按钮
+
+
+def section_title(text: str) -> QLabel:
+    """分组上面的加粗小标题。"""
+    label = QLabel(text)
+    font = label.font()
+    font.setBold(True)
+    label.setFont(font)
+    return label
+
+
+def card_frame(layout) -> QFrame:
+    """淡色圆角卡片：底色 palette(base)、1px 细线色边框、圆角 6。换深色 / 浅色时 recolor_widgets 会换掉边框颜色。"""
+    card = QFrame()
+    card.setObjectName("card")
+    card.setStyleSheet(f"QFrame#card {{ background: palette(base); border: 1px solid {StatusColors().line}; border-radius: 6px; }}")
+    layout.setContentsMargins(14, 10, 14, 10)
+    card.setLayout(layout)
+    return card
+
+
+def titled_section(title: str, layout) -> QWidget:
+    """加粗小标题 + 下面一块圆角卡片。"""
+    box = QWidget()
+    column = QVBoxLayout(box)
+    column.setContentsMargins(0, 0, 0, 0)
+    column.setSpacing(6)
+    column.addWidget(section_title(title))
+    column.addWidget(card_frame(layout))
+    return box
+
+
+def flat_tabs_style() -> str:
+    """标签页的扁平样式：没有方框和底色，选中的标签是强调色文字加 2px 下划线，标签栏下面一条细线。"""
+    return f"""
+QTabWidget::pane {{ border: none; border-top: 1px solid {StatusColors().line}; background: transparent; top: -1px; }}
+QTabWidget::tab-bar {{ left: 0px; }}
+QTabBar {{ background: transparent; }}
+QTabBar::tab {{
+    background: transparent; border: none; border-bottom: 2px solid transparent;
+    padding: 6px 2px; margin-right: 22px; color: palette(window-text);
+}}
+QTabBar::tab:selected {{ color: palette(highlight); border-bottom: 2px solid palette(highlight); }}
+QTabBar::tab:hover:!selected {{ color: palette(highlight); }}
+"""
+
+
+# 按钮的样子（全程序统一）：圆角描边；鼠标移上去描边和文字变成 B 站粉；主按钮（每个窗口里最要紧的那个，
+# 以及对话框里默认的“保存 / 确定”）是粉底白字。颜色不跟深色 / 浅色走，所以不用在换外观时重新设置。
+BUTTON_STYLE = f"""
+QPushButton {{
+    border: 1px solid rgba(128, 128, 128, 0.45); border-radius: 7px; padding: 5px 14px;
+    background: palette(base); color: palette(button-text);
+}}
+QPushButton:hover {{ border-color: {BILI_PINK}; color: #E8548A; }}
+QPushButton:pressed {{ background: rgba(251, 114, 153, 0.18); }}
+QPushButton:focus {{ border-color: {BILI_PINK}; }}
+QPushButton:disabled {{ border-color: rgba(128, 128, 128, 0.25); color: rgba(128, 128, 128, 0.75); background: transparent; }}
+QPushButton:default, QPushButton#primaryButton {{
+    background: #F25D8E; border: 1px solid #F25D8E; color: white; font-weight: bold; padding: 5px 18px;
+}}
+QPushButton:default:hover, QPushButton#primaryButton:hover {{ background: #E84D80; border-color: #E84D80; color: white; }}
+QPushButton:default:pressed, QPushButton#primaryButton:pressed {{ background: #D43F71; border-color: #D43F71; }}
+QPushButton:default:disabled, QPushButton#primaryButton:disabled {{
+    background: rgba(128, 128, 128, 0.25); border-color: transparent; color: rgba(128, 128, 128, 0.9);
+}}
+QPushButton#smallButton {{ padding: 0px 6px; border-radius: 5px; }}
+"""
+
+
+def apply_button_style() -> None:
+    """给整个程序的按钮换上统一的样子。程序启动时调一次。"""
+    app = QApplication.instance()
+    if app is not None and app.styleSheet() != BUTTON_STYLE:
+        app.setStyleSheet(BUTTON_STYLE)
+
+
+def make_primary(button: QPushButton) -> QPushButton:
+    """把按钮做成这一页的主按钮（强调色底）。一页最多一个。"""
+    button.setObjectName("primaryButton")
+    return button
+
+
 # ---------------------------------------------------------------- 左侧功能栏的图标
 
 
@@ -408,7 +495,42 @@ def _draw_settings(painter: QPainter, color: QColor) -> None:
     painter.drawEllipse(QPointF(12, 12), 3, 3)
 
 
-_NAV_DRAWERS = {"rooms": _draw_rooms, "favorites": _draw_favorites, "history": _draw_history, "settings": _draw_settings}
+def _draw_wheel(painter: QPainter, color: QColor) -> None:
+    """独轮车模式：一个轮子（轮圈、轮轴和六根辐条）。"""
+    painter.drawEllipse(QPointF(12, 12), 9, 9)
+    painter.drawEllipse(QPointF(12, 12), 2, 2)
+    for k in range(6):
+        angle = math.radians(k * 60 + 30)
+        dx, dy = math.cos(angle), math.sin(angle)
+        painter.drawLine(QPointF(12 + 2 * dx, 12 + 2 * dy), QPointF(12 + 9 * dx, 12 + 9 * dy))
+
+
+def _draw_book(painter: QPainter, color: QColor) -> None:
+    """说书人模式：一本摊开的书。"""
+    left = QPolygonF([QPointF(12, 6.5), QPointF(7.5, 4.8), QPointF(3, 5.5), QPointF(3, 18.5), QPointF(7.5, 17.8), QPointF(12, 19.5)])
+    right = QPolygonF([QPointF(12, 6.5), QPointF(16.5, 4.8), QPointF(21, 5.5), QPointF(21, 18.5), QPointF(16.5, 17.8), QPointF(12, 19.5)])
+    painter.drawPolygon(left)
+    painter.drawPolygon(right)
+    for y in (9.5, 13):
+        painter.drawLine(QPointF(5.8, y - 0.6), QPointF(9.4, y))
+        painter.drawLine(QPointF(14.6, y), QPointF(18.2, y - 0.6))
+
+
+def _draw_alarm(painter: QPainter, color: QColor) -> None:
+    """只提醒：一个闹钟（钟面、指针、两个铃和两只脚）。"""
+    painter.drawEllipse(QPointF(12, 13), 7.5, 7.5)
+    painter.drawLine(QPointF(12, 13), QPointF(12, 9))
+    painter.drawLine(QPointF(12, 13), QPointF(14.8, 14.6))
+    painter.drawLine(QPointF(3.2, 6.6), QPointF(6.8, 3.6))
+    painter.drawLine(QPointF(20.8, 6.6), QPointF(17.2, 3.6))
+    painter.drawLine(QPointF(7, 19.2), QPointF(5.6, 21))
+    painter.drawLine(QPointF(17, 19.2), QPointF(18.4, 21))
+
+
+_NAV_DRAWERS = {
+    "rooms": _draw_rooms, "favorites": _draw_favorites, "history": _draw_history, "settings": _draw_settings,
+    "wheel": _draw_wheel, "book": _draw_book, "alarm": _draw_alarm,
+}
 
 
 def nav_icon(kind: str) -> QIcon:
@@ -459,14 +581,16 @@ class StatusColors:
     def __init__(self) -> None:
         if is_dark():
             self.ok, self.warn, self.error, self.muted = "#3FB950", "#D29922", "#F85149", "#8B949E"
-            self.selection, self.hover, self.sidebar = "#264F78", "#2D2D30", "#1B1B1C"
+            self.selection, self.hover, self.sidebar = "#5A2E40", "#2D2D30", "#1B1B1C"
+            self.line = "#4A4F55"  # 细线、卡片边框（调色板里的 Mid 在深色下和底色几乎一样，看不见）
         else:
             self.ok, self.warn, self.error, self.muted = "#1A7F37", "#9A6700", "#CF222E", "#6E7781"
-            self.selection, self.hover, self.sidebar = "#CCE8FF", "#E8E8EC", "#F3F3F5"
+            self.selection, self.hover, self.sidebar = "#FFE1EA", "#E8E8EC", "#F3F3F5"
+            self.line = "#C6CBD1"
 
     def values(self) -> tuple[str, ...]:
         """全部颜色，顺序固定：换深色 / 浅色时两套颜色按位置一一对应。"""
-        return self.ok, self.warn, self.error, self.muted, self.selection, self.hover, self.sidebar
+        return self.ok, self.warn, self.error, self.muted, self.selection, self.hover, self.sidebar, self.line
 
 
 # ---------------------------------------------------------------- 深色 / 浅色
@@ -485,6 +609,7 @@ def apply_theme(theme: str) -> None:
     """外观设成跟随系统 / 白天模式 / 黑夜模式。Qt 当场换掉调色板；样式表里写死的颜色要再调 recolor_widgets。"""
     QGuiApplication.styleHints().setColorScheme(_THEME_SCHEMES.get(theme, Qt.ColorScheme.Unknown))
     fit_style()
+    apply_button_style()
 
 
 # Windows 10 深色时 Fusion 用的调色板。Windows 自己给的那套是配 windows11 样式的，Fusion 拿来画的话
@@ -508,7 +633,32 @@ def _fusion_dark_palette() -> QPalette:
     return palette
 
 
+ACCENT = "#F25D8E"  # 强调色（B 站粉，比图标上的粉深一点，白字放上去看得清）：选中、勾选、进度条、主按钮都用它
+
+
+def _apply_accent() -> None:
+    """把调色板里的强调色换成粉色：勾选框、单选按钮、选中的文字、进度条、选中的卡片和标签页都跟着变。"""
+    app = QApplication.instance()
+    palette = app.palette()
+    accent = QColor(ACCENT)
+    roles = [QPalette.ColorRole.Highlight]
+    if hasattr(QPalette.ColorRole, "Accent"):
+        roles.append(QPalette.ColorRole.Accent)
+    if all(palette.color(role) == accent for role in roles):
+        return
+    for role in roles:
+        palette.setColor(role, accent)
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("white"))
+    app.setPalette(palette)
+
+
 def fit_style() -> None:
+    """按现在的深色 / 浅色把样式和调色板配好，再把强调色换成粉色。"""
+    _fit_native_style()
+    _apply_accent()
+
+
+def _fit_native_style() -> None:
     """Windows 10 默认的 windowsvista 样式画不出深色界面：要深色时改用 Fusion 和上面那套调色板，浅色时换回来。"""
     global _native_style
     app = QApplication.instance()
