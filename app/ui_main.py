@@ -139,6 +139,10 @@ class RoomDelegate(NoFocusDelegate):
         size = super().sizeHint(option, index)
         if index.column() == COL_STATUS:
             size.setWidth(size.width() + 20)
+        elif index.column() == COL_NAME:  # 名字很短时，这一列也要放得下第二行的房间号
+            room_id = index.sibling(index.row(), COL_ROOM).data() or ""
+            room_width = QFontMetrics(self._small(option.font)).horizontalAdvance(f"房间 {room_id}")
+            size.setWidth(max(size.width(), room_width + 16))
         return size
 
     def paint(self, painter, option, index) -> None:
