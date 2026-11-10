@@ -1,11 +1,20 @@
 # B站弹幕自动化
 
+[![最新版本](https://img.shields.io/github/v/release/Adaaachiii/bili-auto-danmaku?label=%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC&color=F25D8E)](https://github.com/Adaaachiii/bili-auto-danmaku/releases/latest)
+[![下载次数](https://img.shields.io/github/downloads/Adaaachiii/bili-auto-danmaku/total?label=%E4%B8%8B%E8%BD%BD%E6%AC%A1%E6%95%B0&color=F25D8E)](https://github.com/Adaaachiii/bili-auto-danmaku/releases)
+[![许可证](https://img.shields.io/github/license/Adaaachiii/bili-auto-danmaku?label=%E8%AE%B8%E5%8F%AF%E8%AF%81)](LICENSE)
+![系统](https://img.shields.io/badge/%E7%B3%BB%E7%BB%9F-Windows%2010%20%2F%2011-0078D4)
+
 一个发送弹幕工具：监控选定主播的直播间，开播后按设定的间隔自动发送弹幕，下播后自动停止。当然也可以在主播未开播状态下发送弹幕（有什么意义呢🤔）
 程序可在后台运行，不需要打开网页也能发送弹幕。
 
 > **使用前请先读[免责声明](#免责声明)。** 本程序是个人开发的第三方工具，和哔哩哔哩官方没有任何关系。
 > 自动发送弹幕可能违反B站的用户协议和社区规范，账号可能被限流、禁言甚至封禁，风险由使用者自己承担。
 > 请只在主播同意的直播间或你自己的直播间使用，千万不要用来刷屏或骚扰他人。
+
+![直播间页](docs/screenshots/rooms-light.png)
+
+**[下载最新版](https://github.com/Adaaachiii/bili-auto-danmaku/releases/latest)**　·　[更多截图](#界面预览)
 
 ## 这个工具有什么用
 
@@ -22,6 +31,18 @@
 - 有新版本时提醒，在程序里一键更新
 
 只支持 Windows 10（1809及以上）和 Windows 11 的64位系统。
+
+## 界面预览
+
+截图里的主播、账号和记录都是示例数据。
+
+| 编辑直播间（说书人模式的发送序列） | 深色外观 |
+| --- | --- |
+| ![编辑直播间](docs/screenshots/room-dialog-light.png) | ![深色外观](docs/screenshots/rooms-dark.png) |
+
+| 弹幕收藏夹 | 历史记录 |
+| --- | --- |
+| ![弹幕收藏夹](docs/screenshots/favorites-light.png) | ![历史记录](docs/screenshots/history-light.png) |
 
 ## 下载和安装
 
