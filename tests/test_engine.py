@@ -130,5 +130,44 @@ e._apply_error(1, "网络错误"); e._apply_status(1, ON, "", ""); assert sessio
 e, room = make()  # 没勾这个选项：和以前一样等手动开始（B 里也测过）
 e._apply_status(1, ON, "", ""); assert session(e) is Session.WAIT_NEXT
 print("G 开启软件后即开始发送 OK")
+
+# H. 被禁言：停发，并记下查到的到期时间；重新开始一轮后清掉；查不到也照常停发
+from datetime import datetime  # noqa: E402
+
+from app.engine import mute_until_text  # noqa: E402
+
+real_send = bili_api.send_danmaku
+muted_send = lambda session, creds, rid, msg: bili_api.SendResult(bili_api.SendOutcome.MUTED, "你在本房间被禁言")  # noqa: E731
+asked = []
+bili_api.send_danmaku = muted_send
+bili_api.get_mute_until = lambda session, creds, rid: (asked.append(rid), 1794824687)[1]
+e, room = make()
+e._apply_status(1, OFF, "", ""); e._apply_status(1, ON, "", "")
+send_now(e)
+assert session(e) is Session.MUTED and e.view(1).muted_until == 1794824687 and asked == [1], (e.view(1), asked)
+send_now(e); assert asked == [1]  # 停发以后不再发，也就不再查
+bili_api.send_danmaku = real_send
+assert e.start_session(1) and e.view(1).muted_until == 0  # 手动重新开始：上一轮的到期时间不留着
+assert send_now(e) == 1 and session(e) is Session.SENDING and asked == [1]  # 发成功时不查
+
+
+def mute_query_fails(session, creds, rid):
+    raise bili_api.BiliApiError("网络请求超时")
+
+
+bili_api.send_danmaku = muted_send
+bili_api.get_mute_until = mute_query_fails
+e, room = make()
+e._apply_status(1, OFF, "", ""); e._apply_status(1, ON, "", "")
+send_now(e); assert session(e) is Session.MUTED and e.view(1).muted_until == 0
+bili_api.send_danmaku = real_send
+
+# 到期时间按这台电脑的时区写：今天只写时间，今年带月日，再远带年份
+now = datetime(2026, 11, 15, 12, 0)
+stamp = lambda *parts: int(datetime(*parts).timestamp())  # noqa: E731  本地时间 → 时间戳
+assert mute_until_text(stamp(2026, 11, 15, 18, 24), now) == "18:24"
+assert mute_until_text(stamp(2026, 11, 16, 18, 24), now) == "11-16 18:24"
+assert mute_until_text(stamp(2027, 1, 2, 3, 4), now) == "2027-01-02 03:04"
+print("H 被禁言的到期时间 OK")
 shutil.rmtree(HOME, ignore_errors=True)
 print("全部通过")

@@ -77,6 +77,18 @@ class RoomView:
     story_missing: bool  # 说书人模式但文字文件不见了
     story_part: int = 0  # 发送序列：正在说第几组（从 0 数）
     story_part_titles: tuple[str, ...] = ()  # 发送序列里每一组的标题；只有一组时就一个
+    muted_until: int = 0  # 被禁言到什么时候（Unix 时间戳）；没被禁言或查不到是 0
+
+
+def mute_until_text(until: int, now: datetime | None = None) -> str:
+    """禁言到期时间的写法，按这台电脑的时区：今天到期只写时间，今年的带月日，再远带年份。"""
+    now = now or datetime.now()
+    moment = datetime.fromtimestamp(until)  # 时间戳换成本地时间
+    if moment.date() == now.date():
+        return moment.strftime("%H:%M")
+    if moment.year == now.year:
+        return moment.strftime("%m-%d %H:%M")
+    return moment.strftime("%Y-%m-%d %H:%M")
 
 
 @dataclass
@@ -117,6 +129,7 @@ class _RoomState:
     first_send_at: float | None = None  # 这一轮发出第一条的时间，“每场最多发多少分钟”从这里算
     repeat_index: int = -1  # 独轮车上一条发的是第几项（见 RoomConfig.repeat_items）
     startup: bool = False  # 程序打开时就在监控、还没检测出结果：按“开启软件后即开始发送弹幕”处理
+    muted_until: int = 0  # 这一轮被禁言时查到的到期时间（Unix 时间戳），查不到是 0
 
     @property
     def name(self) -> str:
@@ -143,6 +156,7 @@ class _RoomState:
         self.first_send_at = None
         self.repeat_index = -1  # 每一轮都从文字（没有文字就从第一个表情）开始
         self.story_part_shown = -1
+        self.muted_until = 0
         self.next_send_at = time.monotonic()
         if new_live and self.is_story and not self.cfg.story_inherit:
             self.story_pos = 0
@@ -169,6 +183,7 @@ class _RoomState:
             story_missing=self.is_story and self.story is None,
             story_part=self.story.part_at(self.story_pos) if self.story else 0,
             story_part_titles=tuple(part[0] for part in self.story.parts) if self.story else (),
+            muted_until=self.muted_until if self.session is Session.MUTED else 0,
         )
 
 
@@ -625,7 +640,13 @@ class Engine(QObject):
                     result = SendResult(SendOutcome.AUTH_INVALID, result.message, result.code)
             except BiliApiError as e:
                 result = SendResult(SendOutcome.ERROR, str(e))
-            self._handle_send_result(item, result, sent_at)
+            muted_until = 0
+            if result.outcome is SendOutcome.MUTED:
+                try:  # 只在被禁言的这一刻查一次；查不到就不显示到期时间
+                    muted_until = bili_api.get_mute_until(session, creds, item.room_id)
+                except BiliApiError as e:
+                    log.warning("查询禁言到期时间失败：%s", e)
+            self._handle_send_result(item, result, sent_at, muted_until)
 
     def _limit_reached(self, state: _RoomState, events: list[tuple]) -> bool:
         """到了本场发送上限（成功条数，或从第一条算起的分钟数）就停发。调用时已持有锁。"""
@@ -724,7 +745,9 @@ class Engine(QObject):
         events.append(("log", "info", f"[{state.name}] 说书说完了（{what}都发完了），停止发送（可以右键“说书从头开始”）"))
         events.append(("notify", f"{state.name} 的说书说完了", f"{what}已经全部发完"))
 
-    def _handle_send_result(self, item: _Pending, result: SendResult, sent_at: float | None = None) -> None:
+    def _handle_send_result(
+        self, item: _Pending, result: SendResult, sent_at: float | None = None, muted_until: int = 0
+    ) -> None:
         events: list[tuple] = []
         stamp = time.strftime("%H:%M:%S")
         outcome = result.outcome
@@ -771,7 +794,9 @@ class Engine(QObject):
                 state.session = Session.MUTED
                 state.end_reason = "被禁言"
                 state.last_result = f"{stamp}  被禁言"
-                events.append(("log", "error", f"[{name}] 发送失败：{result.message}，本场停止发送"))
+                state.muted_until = muted_until
+                until = f"（禁言到 {datetime.fromtimestamp(muted_until):%Y-%m-%d %H:%M} 解除）" if muted_until else ""
+                events.append(("log", "error", f"[{name}] 发送失败：{result.message}，本场停止发送{until}"))
                 events.append(("notify", f"{name} 的直播间发送失败", f"{result.message}，本场已停止发送"))
             elif outcome is SendOutcome.FILTERED:
                 # 被屏蔽不算进“连续失败”：既不加一，也不把前面的失败次数清零

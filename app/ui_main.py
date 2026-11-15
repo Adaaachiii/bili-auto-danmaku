@@ -62,7 +62,7 @@ from .config import (
     load_config,
     save_config,
 )
-from .engine import Engine, RoomView, Session
+from .engine import Engine, RoomView, Session, mute_until_text
 from .favorites import FavoritesStore
 from .history import HistoryStore
 from .ui_common import (
@@ -749,6 +749,8 @@ class MainWindow(QMainWindow):
         if view.session is Session.STOPPED:
             return f"{prefix} · 已停发", c.warn, True
         if view.session is Session.MUTED:
+            if view.muted_until > time.time():  # 查到了到期时间，而且还没到
+                return f"{prefix} · 被禁言，{mute_until_text(view.muted_until)} 解除", c.error, True
             return f"{prefix} · 被禁言，已停发", c.error, True
         if view.session is Session.FINISHED:
             return f"{prefix} · 说书已说完", c.warn, True

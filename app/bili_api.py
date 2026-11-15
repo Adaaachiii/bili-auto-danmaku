@@ -26,7 +26,8 @@ COOKIE_DOMAIN = ".bilibili.com"  # 登录 Cookie 只发给这个域名
 ROOM_INIT_URL = "https://api.live.bilibili.com/room/v1/Room/room_init"
 STATUS_BY_UIDS_URL = "https://api.live.bilibili.com/room/v1/Room/get_status_info_by_uids"
 SEND_URL = "https://api.live.bilibili.com/msg/send"
-EMOTICONS_URL = "https://api.live.bilibili.com/xlive/web-ucenter/v2/emoticon/GetEmoticons"
+USER_INFO_URL = "https://api.live.bilibili.com/xlive/web-room/v1/index/getInfoByUser"
+EMOTICONS_URL ="https://api.live.bilibili.com/xlive/web-ucenter/v2/emoticon/GetEmoticons"
 NAV_URL = "https://api.bilibili.com/x/web-interface/nav"
 SPI_URL = "https://api.bilibili.com/x/frontend/finger/spi"
 QR_GENERATE_URL = "https://passport.bilibili.com/x/passport-login/web/qrcode/generate"
@@ -428,6 +429,23 @@ def classify_send_response(code, message: str) -> SendResult:
     if any(hint in message for hint in _MUTED_HINTS):
         return SendResult(SendOutcome.MUTED, message, code)
     return SendResult(SendOutcome.ERROR, message or f"错误码 {code}", code)
+
+
+def get_mute_until(session: requests.Session, creds: Credentials, room_id: int) -> int:
+    """查自己在这个直播间被禁言到什么时候（Unix 时间戳，秒）。没被禁言，或者 B 站没给出到期时间，返回 0。"""
+    raw = _request_json(session, "GET", USER_INFO_URL, params={"room_id": room_id, "from": 0}, cookies=creds.cookies())
+    return parse_mute_until(_check(raw, "查询禁言状态"))
+
+
+def parse_mute_until(data: dict) -> int:
+    """从“直播间里的用户信息”里取禁言到期时间：shield_info.is_block 为真时看 block_expired，没被禁言时它是 0。"""
+    shield = data.get("shield_info")
+    if not isinstance(shield, dict) or shield.get("is_block") not in (True, 1):
+        return 0
+    try:
+        return max(0, int(shield.get("block_expired") or 0))
+    except (TypeError, ValueError):
+        return 0
 
 
 # ---------------------------------------------------------------- 扫码登录

@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from app import bili_api  # noqa: E402
 from app.bili_api import SendOutcome as O, classify_send_response, filter_kind  # noqa: E402
 
 cases = [
@@ -36,4 +37,17 @@ print(f"返回码识别 OK（{len(cases)} 种情况）")
 
 assert filter_kind("f") == "系统屏蔽" and filter_kind("K") == "主播屏蔽" and filter_kind("x") == "被 B 站过滤"
 print("系统屏蔽 / 主播屏蔽 OK")
+
+# 禁言到期时间：只有 is_block 为真、block_expired 是正数才算查到
+parse = bili_api.parse_mute_until
+assert parse({"shield_info": {"is_block": True, "block_expired": 1794824687}}) == 1794824687
+assert parse({"shield_info": {"is_block": 1, "block_expired": "1794824687"}}) == 1794824687
+assert parse({"shield_info": {"is_block": False, "block_expired": 0}}) == 0  # 没被禁言
+assert parse({"shield_info": {"is_block": False, "block_expired": 1794824687}}) == 0  # 禁言已解除，留着旧时间也不算
+assert parse({"shield_info": {"is_block": True, "block_expired": 0}}) == 0  # 被禁言但没给到期时间
+assert parse({"shield_info": {"is_block": True, "block_expired": -1}}) == 0
+assert parse({"shield_info": {"is_block": True, "block_expired": "永久"}}) == 0
+assert parse({"shield_info": {"is_block": True}}) == 0
+assert parse({"shield_info": None}) == 0 and parse({}) == 0
+print("禁言到期时间 OK")
 print("全部通过")

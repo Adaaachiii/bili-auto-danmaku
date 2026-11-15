@@ -41,6 +41,7 @@ eng.time = FakeTime
 outcomes: list = []  # 接下来每次发送的结果，空了就当成功
 bili_api.send_danmaku = lambda s, c, rid, msg: bili_api.SendResult(*(outcomes.pop(0) if outcomes else (Outcome.OK, "")))
 bili_api.get_account_info = lambda s, c: bili_api.AccountInfo(1, "x", 1)
+bili_api.get_mute_until = lambda s, c, rid: 0  # 被禁言时会查到期时间，这里不联网
 
 store = HistoryStore()
 

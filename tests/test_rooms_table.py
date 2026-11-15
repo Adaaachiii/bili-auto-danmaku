@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT))
 from PySide6.QtGui import QFontMetrics  # noqa: E402
 from PySide6.QtWidgets import QApplication, QStyleOptionViewItem, QTableWidget, QTableWidgetItem  # noqa: E402
 
-from app.ui_main import COL_NAME, COL_ROOM, COLUMNS, RoomDelegate  # noqa: E402
+from app.ui_main import COL_NAME, COL_ROOM, COL_STATUS, COLUMNS, RoomDelegate  # noqa: E402
 
 app = QApplication(sys.argv)
 table = QTableWidget(0, len(COLUMNS))
@@ -49,9 +49,28 @@ def test_long_name_still_decides_width() -> None:
     assert long > short and long > need, (short, long, need)
 
 
+def test_mute_status_fits() -> None:
+    """最长的禁言状态（到期时间带年份）画在“状态”一列的胶囊里不会被截断。"""
+    text = "未开播（轮播中） · 被禁言，2027-11-16 18:24 解除"
+    table.setRowCount(1)
+    item = QTableWidgetItem(text)
+    font = table.font()
+    font.setBold(True)  # 禁言状态是加粗的
+    item.setFont(font)
+    table.setItem(0, COL_STATUS, item)
+    option = QStyleOptionViewItem()
+    option.font = table.font()
+    small = delegate._small(font)
+    small.setBold(True)
+    need = QFontMetrics(small).horizontalAdvance(text) + 16 + 12  # 胶囊左右各留 8，格子左右各留 6
+    width = delegate.sizeHint(option, table.model().index(0, COL_STATUS)).width()
+    assert width >= need, (width, need)
+
+
 try:
     test_short_name_keeps_room_id()
     test_long_name_still_decides_width()
+    test_mute_status_fits()
     print("全部通过")
 finally:
     shutil.rmtree(HOME, ignore_errors=True)
